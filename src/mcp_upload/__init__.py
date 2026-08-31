@@ -21,7 +21,7 @@ from .store import MemoryStore, SqliteStore, Store, StoreFull
 from .tickets import Constraints, Outcome, Record, RedeemError, Status
 from .types import AwaitingUpload, FileTransferDescriptor, FileValue, UploadStatus
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     "ERROR_STATUS",

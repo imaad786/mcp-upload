@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.2 (2026-08-31)
+
+Hardening release after a security review. No API removals.
+
+- The declared media type of the file part is validated against the RFC 7230 token
+  grammar and capped in length before it becomes a backend request header or a record
+  field. A bad value is refused with `invalid_media_type` (400).
+- New `max_in_flight` option on `UploadGateway`. Beyond the cap a request gets
+  `too_many_uploads` (503) with `Retry-After`, before its ticket is touched.
+- `SqliteStore` gains `max_records` (default 100,000) with the same sweep-then-refuse
+  behaviour as the in-memory store.
+- The browser page sends `Content-Security-Policy` and `X-Frame-Options: DENY`.
+- The library logs through the `mcp_upload` logger: record ids, destinations and
+  outcome codes. Never the ticket or the upload URL, and a test asserts it.
+- Supply chain: GitHub Actions pinned to commits, read-only workflow tokens, a
+  committed `uv.lock` installed with `--locked` in CI, the build backend pinned,
+  a known-vulnerability audit and a static security scan on every push, Dependabot
+  for the lockfile and the action pins, and `SECURITY.md`.
+
 ## 0.1.1 (2026-08-31)
 
 No code changes. The README published to PyPI now matches the repository: the
