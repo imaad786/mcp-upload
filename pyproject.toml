@@ -48,6 +48,8 @@ dev = [
   "pytest-asyncio>=0.24",
   "ruff>=0.6",
   "mypy>=1.11",
+  # The socket-level tests run the gateway and a backend on loopback.
+  "uvicorn>=0.30",
 ]
 
 [project.urls]
@@ -78,6 +80,12 @@ python_version = "3.11"
 # streaming-form-data ships no type information. A minimal stub lives in typings/ so
 # the parser target can be subclassed under strict mode without loosening it.
 mypy_path = "typings"
+
+# The adapter tests import whichever framework is installed and skip the other. Each
+# lane is missing one of them, and that is expected rather than an error.
+[[tool.mypy.overrides]]
+module = ["fastmcp", "fastmcp.*", "mcp.server.mcpserver", "mcp.server.auth.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
