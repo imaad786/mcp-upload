@@ -42,6 +42,11 @@ local path and only works on one machine, or fetches a URL the model supplies an
 becomes a request forgery. The full argument, with the measurements, is at
 https://imaadkhan.me/writing/the-file-shaped-hole-in-mcp.html.
 
+A backend that already issues presigned upload URLs does not fix this. That keeps
+bytes off your application server, which is a different hop from the one that fails
+here: a tool in front of such a backend still takes base64 in an argument, and the
+model still has to type it.
+
 The MCP changelog for 2026-07-28, in the note on removing sessions, describes the
 replacement for cross-call state: "explicit, server-minted handles passed as ordinary
 tool arguments". An upload ticket is that handle.
@@ -329,6 +334,15 @@ The parser is `streaming-form-data`, a compiled extension. Wheels exist for CPyt
 
 **Base64 in a tool argument.** Works for toy files. Fails on anything real, and
 fails in the transport at 4 MiB before the model's output ceiling is even a factor.
+
+**A backend that already issues presigned upload URLs.** Canvas works that way, so
+does S3 presigned POST, and structurally it is the same ticket. It applies at a
+different hop. Keeping bytes off your application server and keeping them out of the
+model are separate properties, and a tool wrapping such a backend still takes base64
+in an argument unless its own interface hands the ticket outward. This library is
+about the second property. It does not do the first: the gateway stays in the byte
+path on purpose, which is what lets it enforce the size cap on what actually arrives
+and record whether the upload finished.
 
 **FastMCP's `FileUpload` provider.** A drag-and-drop widget in an MCP Apps host
 calls an app-only tool, so the model never types the bytes. It needs no
