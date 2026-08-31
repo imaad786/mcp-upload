@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 (2026-08-31)
+
+No code changes. The README published to PyPI now matches the repository: the
+tokenizer note says Claude's counts were not measured rather than asserting they run
+higher, and a provenance section carries the AI disclosure, credits SEP-2631 by Casey
+Chow for the wire shapes, and names the implementers who arrived at the pattern
+independently.
+
 ## 0.1.0 (2026-08-31)
 
 First release. Targets MCP protocol revision 2026-07-28.
