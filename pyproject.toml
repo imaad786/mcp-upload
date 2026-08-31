@@ -1,0 +1,81 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-upload"
+dynamic = ["version"]
+description = "File uploads for MCP servers using short-lived upload tickets."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Imaad Zaffar Khan", email = "kimaad71@gmail.com" }]
+keywords = ["mcp", "model-context-protocol", "file-upload", "upload", "starlette", "asgi"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Framework :: AsyncIO",
+  "Topic :: Software Development :: Libraries",
+  "Typing :: Typed",
+]
+# starlette is the request and routing surface the core handler is written against.
+# httpx streams the upload body onward to the destination backend.
+# streaming-form-data parses multipart incrementally, which is what lets the server
+# forward bytes without buffering the file in memory or on disk. It ships compiled
+# wheels for CPython 3.10 to 3.13 as of 2.1.0, which is why the CI matrix stops at 3.13.
+dependencies = [
+  "starlette>=1.0",
+  "httpx>=0.28",
+  "streaming-form-data>=2.0",
+]
+
+[project.optional-dependencies]
+# Each adapter is a thin registration of the same core handler on a server instance.
+# The two extras are mutually exclusive: fastmcp 3.x pins the official SDK to mcp<2,
+# while the mcp extra targets SDK 2.x. Install one or the other, never both. That is
+# also why neither framework is in the dev extra and why CI runs one lane per framework.
+# Upper bounds are deliberate: both frameworks shipped or announced a breaking major
+# release within weeks of this project starting.
+mcp = ["mcp>=2.1,<3"]
+fastmcp = ["fastmcp>=3.4,<4"]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.6",
+  "mypy>=1.11",
+]
+
+[project.urls]
+Repository = "https://github.com/imaadkhan-tz/mcp-upload"
+Issues = "https://github.com/imaadkhan-tz/mcp-upload/issues"
+
+[tool.hatch.version]
+path = "src/mcp_upload/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_upload"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests"]
+python_version = "3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
