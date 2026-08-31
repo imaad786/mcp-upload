@@ -9,6 +9,9 @@ on:
 
 jobs:
   build:
+    # The repository is mirrored to a second account. Only the account registered
+    # with PyPI as the trusted publisher may build and publish.
+    if: github.repository == 'imaad786/mcp-upload'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +28,7 @@ jobs:
           path: dist/
 
   publish:
+    if: github.repository == 'imaad786/mcp-upload'
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
