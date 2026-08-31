@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.3 (2026-08-31)
+
+Documentation only. No code changes, no API changes.
+
+- The README now separates two claims that the upload ticket pattern gets credited
+  for. A backend that already issues presigned upload URLs keeps file bytes off the
+  application server, which is a different hop from the tool interface this library
+  addresses. A tool wrapping such a backend still takes base64 in an argument. Stated
+  in the problem section and added as an entry to the alternatives comparison, along
+  with the note that the gateway stays in the byte path deliberately.
+
 ## 0.1.2 (2026-08-31)
 
 Hardening release after a security review. No API removals.
