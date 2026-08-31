@@ -129,6 +129,11 @@ CREATE TABLE IF NOT EXISTS tickets (
 CREATE INDEX IF NOT EXISTS tickets_retention ON tickets (retention_until);
 """
 
+_SELECT_BY = {
+    "id": "SELECT * FROM tickets WHERE id = ?",
+    "ticket_hash": "SELECT * FROM tickets WHERE ticket_hash = ?",
+}
+
 
 class SqliteStore:
     """A store in a database file, for a single host running one or more workers.
@@ -144,9 +149,16 @@ class SqliteStore:
     wait instead of failing with "database is locked".
     """
 
-    def __init__(self, path: str | PathLike[str], *, timeout: float = 10.0) -> None:
+    def __init__(
+        self, path: str | PathLike[str], *, timeout: float = 10.0, max_records: int | None = 100_000
+    ) -> None:
+        """``max_records`` bounds the table the same way the in-memory store is bounded.
+        When it is reached, records past their retention deadline are deleted first,
+        and if that frees nothing the new record is refused with ``StoreFull``. Pass
+        ``None`` only if something else sweeps the table on a schedule."""
         self._path = str(path)
         self._timeout = timeout
+        self._max = max_records
         with closing(self._connect()) as conn:
             conn.executescript(_SCHEMA)
 
@@ -162,6 +174,16 @@ class SqliteStore:
 
     def _put(self, record: Record) -> None:
         with closing(self._connect()) as conn:
+            if self._max is not None:
+                count = conn.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
+                if count >= self._max:
+                    conn.execute(
+                        "DELETE FROM tickets WHERE retention_until <= ?",
+                        (record.issued_at.timestamp(),),
+                    )
+                    count = conn.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
+                    if count >= self._max:
+                        raise StoreFull(f"sqlite store holds {self._max} records")
             conn.execute(
                 "INSERT INTO tickets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
@@ -187,8 +209,9 @@ class SqliteStore:
         return await asyncio.to_thread(self._select, "ticket_hash", ticket_hash)
 
     def _select(self, column: str, value: str) -> Record | None:
+        # One literal statement per indexed column. The value is always a parameter.
         with closing(self._connect()) as conn:
-            row = conn.execute(f"SELECT * FROM tickets WHERE {column} = ?", (value,)).fetchone()
+            row = conn.execute(_SELECT_BY[column], (value,)).fetchone()
         return None if row is None else _row_to_record(row)
 
     async def redeem(self, ticket_hash: str, now: datetime) -> Record | RedeemError:

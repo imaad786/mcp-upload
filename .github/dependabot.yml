@@ -1,0 +1,13 @@
+# Weekly pull requests for dependency updates, in two places: the Python
+# dependencies resolved in uv.lock, and the commit-pinned GitHub Actions in the
+# workflow files. Security advisories open a pull request as soon as they publish.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

@@ -25,6 +25,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import logging
+import re
 import secrets
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -57,6 +59,18 @@ from .tickets import (
 )
 from .types import AwaitingUpload, FileTransferDescriptor, FileValue, UploadStatus
 
+# The library logs through this name. Records are identified by their public id only.
+# The ticket secret and the upload URL never appear in a log line.
+logger = logging.getLogger("mcp_upload")
+logger.addHandler(logging.NullHandler())
+
+# The token grammar of RFC 7230, which is what a media type is made of. Anything the
+# multipart parser hands us that does not match is refused rather than forwarded,
+# because the value becomes a request header to the backend and a field on the record.
+_TCHARS = r"[A-Za-z0-9!#$%&'*+.^_`|~-]+"
+_MEDIA_TYPE = re.compile(rf"^{_TCHARS}/{_TCHARS}$")
+_MAX_MEDIA_TYPE_LENGTH = 255
+
 # Every failure the endpoint can report, and the HTTP status it maps to. Backend error
 # text is never passed through; a backend failure becomes one of these codes.
 ERROR_STATUS: dict[str, int] = {
@@ -66,8 +80,10 @@ ERROR_STATUS: dict[str, int] = {
     "ticket_used": 410,
     "ticket_expired": 410,
     "too_large": 413,
+    "too_many_uploads": 503,
     "missing_file": 400,
     "duplicate_file": 400,
+    "invalid_media_type": 400,
     "unsupported_media_type": 415,
     "bad_multipart": 400,
     "unexpected_part": 400,
@@ -120,6 +136,7 @@ class UploadGateway:
         retention: timedelta = timedelta(hours=24),
         http: httpx.AsyncClient | None = None,
         queue_size: int = 4,
+        max_in_flight: int | None = None,
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         """
@@ -132,6 +149,12 @@ class UploadGateway:
 
         ``queue_size`` is how many parsed chunks may sit between the parser and the
         backend request. Small on purpose: that bound is the backpressure.
+
+        ``max_in_flight`` caps how many uploads may be streaming at once. Each one
+        holds a parser, a queue and a connection to the backend, so without a cap a
+        flood of slow uploads exhausts the worker. Beyond the cap a request gets 503
+        before its ticket is touched, so it can be retried. Leave it ``None`` only when
+        something in front of the server enforces a limit.
         """
         self._base_url = base_url.rstrip("/")
         self._registry = registry
@@ -144,6 +167,8 @@ class UploadGateway:
         self._http = http or httpx.AsyncClient()
         self._owns_http = http is None
         self._queue_size = queue_size
+        self._max_in_flight = max_in_flight
+        self._in_flight = 0
         self._clock = clock
         self._transport = urlsplit(self._base_url).scheme or "https"
 
@@ -187,6 +212,7 @@ class UploadGateway:
             constraints=constraints,
         )
         await self._store.put(record)
+        logger.info("issued %s for destination %s", record.id, dest.name)
         return Issued(record=record, secret=secret, upload_url=self.upload_url(secret))
 
     def upload_url(self, secret: str) -> str:
@@ -284,6 +310,8 @@ class UploadGateway:
         code = multipart_error(request.headers)
         if code is not None:
             return self._error_response(request, None, code)
+        if self._max_in_flight is not None and self._in_flight >= self._max_in_flight:
+            return self._error_response(request, None, "too_many_uploads")
 
         ticket_hash = hash_secret(secret)
         now = self._clock()
@@ -314,11 +342,16 @@ class UploadGateway:
             return self._error_response(request, record, code)
 
         # Steps 4 and 5.
-        status, outcome = await self._forward(request, redeemed, dest)
+        self._in_flight += 1
+        try:
+            status, outcome = await self._forward(request, redeemed, dest)
+        finally:
+            self._in_flight -= 1
         final = await self._store.finish(redeemed.id, status, outcome, self._clock())
         if final is None:
             final = redeemed.finished(status, outcome, self._clock())
         if status is Status.COMPLETED:
+            logger.info("completed %s: %d bytes to %s", final.id, outcome.size, dest.name)
             return self._success_response(request, final)
         return self._error_response(request, final, outcome.error or "internal")
 
@@ -425,9 +458,11 @@ class UploadGateway:
         body: dict[str, Any] = {"status": "failed", "error": code}
         if record is not None:
             body["id"] = record.id
+        logger.warning("refused %s: %s", record.id if record else "-", code)
+        headers = {"Retry-After": "5"} if code == "too_many_uploads" else None
         if _wants_html(request):
             return _html(page.message("Upload failed", code.replace("_", " ")), http_status)
-        return _json(body, http_status)
+        return _json(body, http_status, headers)
 
 
 # ----- the streaming machinery -------------------------------------------------------
@@ -491,11 +526,16 @@ class _FileTarget(BaseTarget):
             # A part with the right name but no filename is a plain form field, not a
             # file. Treating it as a file is how a text value ends up read as bytes.
             raise UploadError("missing_file", "the file part has no filename")
-        if not self._constraints.allows(self.multipart_content_type):
-            raise UploadError("unsupported_media_type", str(self.multipart_content_type))
-        self.filename = sanitize_filename(self.multipart_filename)
         declared = self.multipart_content_type or "application/octet-stream"
-        self.media_type = declared.split(";", 1)[0].strip().lower()
+        media_type = declared.split(";", 1)[0].strip().lower()
+        if len(media_type) > _MAX_MEDIA_TYPE_LENGTH or not _MEDIA_TYPE.fullmatch(media_type):
+            # The parser passes the header value through as-is, control characters and
+            # all. It is about to become a header on the backend request.
+            raise UploadError("invalid_media_type", "declared media type is not a valid token")
+        if not self._constraints.allows(media_type):
+            raise UploadError("unsupported_media_type", media_type)
+        self.filename = sanitize_filename(self.multipart_filename)
+        self.media_type = media_type
         self._state.started.set()
 
     async def on_data_received_async(self, chunk: bytes) -> None:
@@ -603,14 +643,23 @@ def _upstream(
 
 _NO_STORE = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
 
+# The page carries a live credential in its URL and a form that mutates state. It
+# loads nothing external, so the policy can refuse everything but its own inline
+# style, and it must never be framed by another site.
+_PAGE_HEADERS = {
+    **_NO_STORE,
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+    "X-Frame-Options": "DENY",
+}
 
-def _json(body: dict[str, Any], status: int) -> Response:
-    return JSONResponse(body, status_code=status, headers=_NO_STORE)
+
+def _json(body: dict[str, Any], status: int, extra: dict[str, str] | None = None) -> Response:
+    return JSONResponse(body, status_code=status, headers={**_NO_STORE, **(extra or {})})
 
 
 def _html(body: str, status: int) -> Response:
-    headers = {**_NO_STORE, "Referrer-Policy": "no-referrer"}
-    return HTMLResponse(body, status_code=status, headers=headers)
+    return HTMLResponse(body, status_code=status, headers=_PAGE_HEADERS)
 
 
 def _wants_html(request: Request) -> bool:

@@ -53,7 +53,19 @@ dev = [
   "mypy>=1.11",
   # The socket-level tests run the gateway and a backend on loopback.
   "uvicorn>=0.30",
+  # Run in CI on every push: known-vulnerability audit of the locked dependencies,
+  # and a static security scan of the source.
+  "pip-audit>=2.7",
+  "bandit>=1.7",
 ]
+
+[tool.uv]
+# The mcp and fastmcp extras cannot be installed together (fastmcp 3.x pins mcp<2).
+# Declaring the conflict lets uv produce one lockfile that covers both lanes.
+conflicts = [[{ extra = "mcp" }, { extra = "fastmcp" }]]
+# The build backend is not covered by the lockfile. Pinning it here means `uv build`
+# in the release workflow uses a known version rather than the newest on the day.
+build-constraint-dependencies = ["hatchling==1.32.0"]
 
 [project.urls]
 Repository = "https://github.com/imaadkhan-tz/mcp-upload"

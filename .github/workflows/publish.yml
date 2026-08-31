@@ -1,11 +1,14 @@
 name: publish
 
 # Builds on a version tag and publishes to PyPI through trusted publishing, so no
-# token is stored in the repository. The PyPI project has to list this repository,
-# this workflow file, and the "pypi" environment as a trusted publisher first.
+# token is stored in the repository. The PyPI project lists this repository, this
+# workflow file, and the "pypi" environment as its trusted publisher.
 on:
   push:
     tags: ["v*"]
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -14,15 +17,16 @@ jobs:
     if: github.repository == 'imaad786/mcp-upload'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # Pinned to commits, see ci.yml for why.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           python-version: "3.13"
       - name: Build
-        run: |
-          python -m pip install --upgrade build
-          python -m build
-      - uses: actions/upload-artifact@v4
+        # The build backend version is pinned in pyproject.toml under [tool.uv], so
+        # the artifact does not depend on whatever hatchling is newest on the day.
+        run: uv build
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist
           path: dist/
@@ -33,10 +37,11 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
+      contents: read
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

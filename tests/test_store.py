@@ -107,6 +107,24 @@ async def test_memory_store_refuses_beyond_its_cap() -> None:
         await store.put(make_record("c"))
 
 
+async def test_sqlite_store_refuses_beyond_its_cap(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "t.db", max_records=2)
+    await store.put(make_record("a"))
+    await store.put(make_record("b"))
+    with pytest.raises(StoreFull):
+        await store.put(make_record("c"))
+
+
+async def test_sqlite_store_sweeps_before_refusing(tmp_path: Path) -> None:
+    store = SqliteStore(tmp_path / "t.db", max_records=1)
+    old = make_record("old", retention_until=NOW - timedelta(seconds=1))
+    await store.put(old)
+    fresh = make_record("fresh", issued_at=NOW)
+    await store.put(fresh)
+    assert await store.get(old.id) is None
+    assert await store.get(fresh.id) is not None
+
+
 async def test_memory_store_sweeps_before_refusing() -> None:
     store = MemoryStore(max_records=1)
     old = make_record("old", retention_until=NOW - timedelta(seconds=1))

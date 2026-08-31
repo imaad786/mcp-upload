@@ -303,7 +303,9 @@ ticket, so a stray or hostile non-multipart POST cannot burn someone's pending u
 | `unknown_ticket` | 404 | |
 | `ticket_used`, `ticket_expired` | 410 | |
 | `too_large` | 413 | On declared length or on the running count |
+| `too_many_uploads` | 503 | `max_in_flight` reached, ticket untouched, `Retry-After` set |
 | `missing_file`, `duplicate_file`, `unexpected_part`, `bad_multipart`, `truncated` | 400 | |
+| `invalid_media_type` | 400 | Declared type is not a valid `type/subtype` token |
 | `unsupported_media_type` | 415 | Declared type not in the accept list |
 | `client_disconnected` | 400 | Recorded on the record. No response reaches the client. |
 | `upstream_unreachable`, `upstream_rejected`, `upstream_closed_early` | 502 | Backend failure, mapped, never echoed |
@@ -348,6 +350,29 @@ The tool-first ordering used here is the proposal's stated fallback for when the
 client cannot bind the file before the call, which today is every host. The record
 carries a stable `mcp-file://` URI from the start so that a `files/authorizeUpload`
 adapter is a thin addition when the proposal lands.
+
+## Deploying it
+
+Four things the library cannot do for you.
+
+- **TLS.** The ticket travels in the URL. Serve the endpoint over HTTPS only and set
+  `base_url` to the `https` origin clients will use.
+- **Limits.** Set `max_in_flight` on the gateway. Each streaming upload holds a parser,
+  a queue and a backend connection, and beyond the cap a request gets 503 with
+  `Retry-After` before its ticket is touched. Per-client rate limiting and a request
+  size ceiling still belong at your reverse proxy. Both stores cap the number of
+  records they hold (`max_records`) and sweep expired ones when full.
+- **Destinations.** A destination is an address inside your network that the server
+  streams client-supplied bytes to. Register only endpoints built to receive uploads.
+  `Destination.headers` is where a backend credential goes if one is needed. It stays
+  in memory and is never logged or returned.
+- **Logs.** The library logs through the `mcp_upload` logger: record ids, destination
+  names and outcome codes, never the ticket or the upload URL. Your access logs will
+  hold the ticket URL, so scrub the path or accept that a leaked log yields tickets
+  that expire in fifteen minutes and work once.
+
+Vulnerabilities go through GitHub's private reporting on this repository. See
+`SECURITY.md`.
 
 ## Limits and non-goals
 
