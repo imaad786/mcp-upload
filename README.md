@@ -382,6 +382,23 @@ uv venv .venv-fastmcp && uv pip install --python .venv-fastmcp/bin/python -e ".[
 Two environments because the two frameworks cannot share one. The suite includes
 socket-level tests that run the gateway and a backend under uvicorn on loopback.
 
+## Provenance
+
+The design comes from production systems I built and ran, in C# on ASP.NET Core, and
+rebuilt here in Python. The code, the tests and this README were written with AI
+assistance (Claude Code) under my direction and review.
+
+The wire shapes follow the MCP file transfer proposal,
+[SEP-2631](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2631), by
+Casey Chow (OpenAI). The pattern itself has been arrived at independently by several
+implementers, among them
+[Notion's MCP server](https://developers.notion.com/guides/mcp/mcp-supported-tools),
+[FutureSearch](https://futuresearch.ai/blog/mcp-large-dataset-upload/) and
+[zenk-co/mcp-upload-kit](https://github.com/zenk-co/mcp-upload-kit). The earliest
+request for it in the MCP repository is
+[discussion #1197](https://github.com/modelcontextprotocol/modelcontextprotocol/discussions/1197),
+from December 2024.
+
 ## License
 
 Apache 2.0. See LICENSE.

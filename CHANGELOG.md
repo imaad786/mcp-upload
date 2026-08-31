@@ -25,3 +25,4 @@ First release. Targets MCP protocol revision 2026-07-28.
   multi-round-trip flow on the official SDK.
 - Examples: a stub backend, an MCP server with `request_upload`,
   `request_upload_interactive` and `check_upload`, and a Python client.
+- Written with AI assistance (Claude Code) under human direction and review.
