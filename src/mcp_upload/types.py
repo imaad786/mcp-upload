@@ -53,7 +53,8 @@ class AwaitingUpload(TypedDict):
 
 class UploadStatus(TypedDict):
     """What a status lookup returns. ``status`` is one of issued, redeemed, completed,
-    failed, or unknown. ``file`` is present once the upload completed."""
+    failed, expired or unknown, plus declined or cancelled when the user was asked
+    through elicitation and refused. ``file`` is present once the upload completed."""
 
     id: str
     status: str

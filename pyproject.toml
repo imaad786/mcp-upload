@@ -84,7 +84,14 @@ mypy_path = "typings"
 # The adapter tests import whichever framework is installed and skip the other. Each
 # lane is missing one of them, and that is expected rather than an error.
 [[tool.mypy.overrides]]
-module = ["fastmcp", "fastmcp.*", "mcp.server.mcpserver", "mcp.server.auth.*"]
+module = [
+  "fastmcp",
+  "fastmcp.*",
+  "mcp.client.client",
+  "mcp.server.mcpserver",
+  "mcp.server.auth.*",
+  "mcp_types",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

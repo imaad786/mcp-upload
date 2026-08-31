@@ -9,16 +9,25 @@ from __future__ import annotations
 
 import importlib.util
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import pytest
 
 from mcp_upload import Destination, MemoryStore, Registry, UploadGateway
+from mcp_upload.types import UploadStatus
 from tests.conftest import Upstream, multipart
 
 HAS_OFFICIAL_SDK = importlib.util.find_spec("mcp.server.mcpserver") is not None
 HAS_FASTMCP = importlib.util.find_spec("fastmcp") is not None
+
+if HAS_OFFICIAL_SDK:
+    # Module level on purpose: the SDK evaluates a tool's annotations by name against
+    # the function's module globals, so these cannot live inside a test function.
+    from mcp.server.mcpserver import Context, MCPServer
+    from mcp_types import ElicitResult, InputRequiredResult
+
+    from mcp_upload.adapters.mcp import ask_for_upload
 
 
 @pytest.fixture
@@ -52,8 +61,6 @@ async def round_trip(app: Any, gateway: UploadGateway, upstream: Upstream) -> No
 
 @pytest.mark.skipif(not HAS_OFFICIAL_SDK, reason="official SDK 2.x not installed")
 async def test_official_sdk_adapter(gateway: UploadGateway, upstream: Upstream) -> None:
-    from mcp.server.mcpserver import MCPServer
-
     from mcp_upload.adapters.mcp import attach
 
     server = MCPServer("adapter-test")
@@ -70,7 +77,6 @@ async def test_official_sdk_auth_does_not_guard_the_upload_route(
     # routes skip its authorization. If an SDK upgrade ever changes that, this fails.
     from mcp.server.auth.provider import AccessToken
     from mcp.server.auth.settings import AuthSettings
-    from mcp.server.mcpserver import MCPServer
     from pydantic import AnyHttpUrl
 
     from mcp_upload.adapters.mcp import attach
@@ -97,6 +103,68 @@ async def test_official_sdk_auth_does_not_guard_the_upload_route(
         assert guarded.status_code == 401
         issued = await gateway.issue("files")
         assert (await client.get(issued.upload_url)).status_code == 200
+
+
+class CountingStore(MemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.puts = 0
+
+    async def put(self, record: Any) -> None:
+        self.puts += 1
+        await super().put(record)
+
+
+@pytest.mark.skipif(not HAS_OFFICIAL_SDK, reason="official SDK 2.x not installed")
+@pytest.mark.parametrize(
+    ("action", "expected_status"),
+    [("accept", "issued"), ("decline", "declined"), ("cancel", "cancelled")],
+)
+async def test_official_sdk_two_round_elicitation(
+    upstream: Upstream, action: Literal["accept", "decline", "cancel"], expected_status: str
+) -> None:
+    # The 2026-07-28 flow: the tool returns input_required with a URL-mode
+    # elicitation, the client answers and retries, the tool runs again and reports.
+    # One ticket must be minted across both rounds.
+    from mcp.client.client import Client
+
+    from mcp_upload.adapters.mcp import attach
+
+    store = CountingStore()
+    registry = Registry(Destination(name="files", url="http://backend.test/files/{filename}"))
+    gateway = UploadGateway(
+        base_url="http://server.test",
+        registry=registry,
+        store=store,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(upstream.handler)),
+    )
+    server = MCPServer("mrtr-test")
+    attach(server, gateway)
+
+    async def request_file(ctx: Context[Any, Any]) -> UploadStatus | InputRequiredResult:
+        return await ask_for_upload(ctx, gateway, "files", message="Send the report")
+
+    server.tool()(request_file)
+
+    asked: list[Any] = []
+
+    async def answer(context: Any, params: Any) -> ElicitResult:
+        asked.append(params)
+        return ElicitResult(action=action)
+
+    async with Client(server, elicitation_callback=answer) as client:
+        result = await client.call_tool("request_file")
+
+    assert len(asked) == 1
+    assert asked[0].mode == "url"
+    assert asked[0].message == "Send the report"
+    assert asked[0].url.startswith("http://server.test/upload/")
+    status = result.structured_content
+    assert status is not None
+    assert status["status"] == expected_status
+    assert status["id"].startswith("up_")
+    assert store.puts == 1
+    assert (await gateway.status(status["id"]))["status"] == "issued"
 
 
 @pytest.mark.skipif(not HAS_FASTMCP, reason="fastmcp not installed")

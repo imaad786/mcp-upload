@@ -15,10 +15,11 @@ from __future__ import annotations
 import os
 
 import uvicorn
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
+from mcp_types import InputRequiredResult
 
 from mcp_upload import Destination, MemoryStore, Registry, UploadGateway
-from mcp_upload.adapters.mcp import attach
+from mcp_upload.adapters.mcp import ask_for_upload, attach
 from mcp_upload.types import AwaitingUpload, UploadStatus
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8000")
@@ -57,6 +58,16 @@ async def request_upload() -> AwaitingUpload:
     Send the file there as a multipart POST with the field name 'file'."""
     issued = await gateway.issue("files", caller="request_upload")
     return gateway.describe(issued)
+
+
+@mcp.tool()
+async def request_upload_interactive(ctx: Context) -> UploadStatus | InputRequiredResult:
+    """Ask the user for a file through the client, if the client supports URL-mode
+    elicitation. The client shows the upload link and asks for consent; this tool
+    then reports the upload's status. Call check_upload later to see it complete."""
+    return await ask_for_upload(
+        ctx, gateway, "files", caller="request_upload_interactive", message="Upload the file here."
+    )
 
 
 @mcp.tool()
