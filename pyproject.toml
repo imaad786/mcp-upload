@@ -75,6 +75,9 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 strict = true
 files = ["src", "tests"]
 python_version = "3.11"
+# streaming-form-data ships no type information. A minimal stub lives in typings/ so
+# the parser target can be subclassed under strict mode without loosening it.
+mypy_path = "typings"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
