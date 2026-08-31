@@ -24,10 +24,11 @@ Tool arguments are model output, generated token by token, so the model has to
 produce the whole encoded file, perfectly. Base64 tokenizes at roughly 1.4 to 1.5
 characters per token on OpenAI's encoders (English runs about five). A 126 KB image
 costs about 120,000 output tokens. That is 94% of the 128,000-token per-response
-ceiling of the largest models available today and over the ceiling of most others.
-A 500 KiB photo costs about 490,000 tokens, which is past every model from every
-vendor. Anthropic's tokenizer counts higher than OpenAI's, not lower. The request
-does not finish. Bigger context windows do not help.
+ceiling of the largest models available today and over the 64,000-token ceiling of
+smaller ones. A 500 KiB photo costs about 490,000 tokens, almost four times the larger
+ceiling. These are OpenAI tokenizer counts. Anthropic publishes no offline tokenizer,
+so Claude's were not measured, and nothing about base64 suggests they would be kinder.
+The request does not finish. Bigger context windows do not help.
 
 There is a second wall that has nothing to do with the model. The official Python
 SDK's Streamable HTTP server rejects any request body over 4 MiB with HTTP 413
