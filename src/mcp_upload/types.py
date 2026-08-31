@@ -12,7 +12,17 @@ tool output schema from them on its own.
 
 from __future__ import annotations
 
-from typing import Literal, NotRequired, TypedDict
+import sys
+from typing import Literal, NotRequired
+
+# The MCP SDK builds tool output schemas with pydantic, which only understands the
+# typing_extensions TypedDict on Python 3.11. On 3.11 the standard library one is
+# accepted silently and produces no schema, so tools would return text instead of
+# structured content.
+if sys.version_info >= (3, 12):
+    from typing import TypedDict
+else:
+    from typing_extensions import TypedDict
 
 
 class FileDigest(TypedDict):

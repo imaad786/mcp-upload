@@ -32,6 +32,9 @@ dependencies = [
   "starlette>=1.0",
   "httpx>=0.28",
   "streaming-form-data>=2.0",
+  # For TypedDict on Python 3.11, where pydantic (used by the MCP SDK for tool output
+  # schemas) does not accept the standard library one.
+  "typing-extensions>=4.5; python_version < '3.12'",
 ]
 
 [project.optional-dependencies]

@@ -15,7 +15,7 @@ import httpx
 import pytest
 
 from mcp_upload import Destination, MemoryStore, Registry, UploadGateway
-from mcp_upload.types import UploadStatus
+from mcp_upload.types import AwaitingUpload, UploadStatus
 from tests.conftest import Upstream, multipart
 
 HAS_OFFICIAL_SDK = importlib.util.find_spec("mcp.server.mcpserver") is not None
@@ -103,6 +103,32 @@ async def test_official_sdk_auth_does_not_guard_the_upload_route(
         assert guarded.status_code == 401
         issued = await gateway.issue("files")
         assert (await client.get(issued.upload_url)).status_code == 200
+
+
+@pytest.mark.skipif(not HAS_OFFICIAL_SDK, reason="official SDK 2.x not installed")
+async def test_official_sdk_returns_structured_content(
+    gateway: UploadGateway, upstream: Upstream
+) -> None:
+    # The wire shapes are TypedDicts. The SDK must turn them into an output schema and
+    # structured content on every supported Python, not fall back to text.
+    from mcp.client.client import Client
+
+    server = MCPServer("structured-test")
+
+    async def request_upload() -> AwaitingUpload:
+        return gateway.describe(await gateway.issue("files"))
+
+    server.tool()(request_upload)
+
+    async with Client(server) as client:
+        listed = await client.list_tools()
+        assert listed.tools[0].output_schema is not None
+        assert "upload" in listed.tools[0].output_schema.get("properties", {})
+        result = await client.call_tool("request_upload")
+
+    assert result.structured_content is not None
+    assert result.structured_content["status"] == "awaiting_upload"
+    assert result.structured_content["upload"]["method"] == "POST"
 
 
 class CountingStore(MemoryStore):
