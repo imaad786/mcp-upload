@@ -20,6 +20,20 @@ jobs:
         # One lane per server framework. fastmcp 3.x pins mcp<2, so the two extras
         # cannot be installed together. Core tests run in both lanes.
         framework: ["mcp", "fastmcp"]
+    # The Redis store's tests fall back to fakeredis when this is absent, which keeps
+    # the suite runnable with no service. fakeredis reimplements Lua through lupa, and
+    # the one thing this store exists to guarantee is atomic redemption, so CI points
+    # the same tests at a real server rather than trusting the simulator.
+    services:
+      redis:
+        image: redis:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
       # Every action is pinned to a commit, not a tag. A tag can be moved to different
       # code by whoever controls the action's repository; a commit cannot. Dependabot
@@ -39,6 +53,8 @@ jobs:
       - name: Type check
         run: uv run mypy
       - name: Test
+        env:
+          MCP_UPLOAD_TEST_REDIS_URL: redis://localhost:6379/0
         run: uv run pytest
       - name: Audit locked dependencies for known vulnerabilities
         run: |

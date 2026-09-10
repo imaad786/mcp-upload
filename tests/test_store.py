@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -39,11 +41,32 @@ def make_record(secret: str = "s", *, ttl_minutes: int = 15, **overrides: object
     return Record(**fields)  # type: ignore[arg-type]
 
 
-@pytest.fixture(params=["memory", "sqlite"])
+def _redis_client() -> object:
+    """A real Redis when MCP_UPLOAD_TEST_REDIS_URL is set, otherwise fakeredis.
+
+    Both are exercised on purpose. fakeredis keeps the suite runnable with no service,
+    but it reimplements Lua through lupa, so CI also points this at a real server. A
+    store whose whole job is atomicity should not be certified by a simulator alone.
+    """
+    url = os.environ.get("MCP_UPLOAD_TEST_REDIS_URL")
+    if url:
+        from redis.asyncio import Redis
+
+        return Redis.from_url(url)
+    fakeredis = pytest.importorskip("fakeredis", reason="fakeredis is not installed")
+    return fakeredis.aioredis.FakeRedis()
+
+
+@pytest.fixture(params=["memory", "sqlite", "redis"])
 def store(request: pytest.FixtureRequest, tmp_path: Path) -> Store:
     if request.param == "memory":
         return MemoryStore()
-    return SqliteStore(tmp_path / "tickets.db")
+    if request.param == "sqlite":
+        return SqliteStore(tmp_path / "tickets.db")
+    from mcp_upload.redis_store import RedisStore
+
+    # A prefix per test so a real shared Redis cannot leak records between them.
+    return RedisStore(_redis_client(), prefix=f"t{uuid.uuid4().hex}")  # type: ignore[arg-type]
 
 
 async def test_fifty_concurrent_redemptions_have_one_winner(store: Store) -> None:

@@ -28,6 +28,7 @@ if HAS_OFFICIAL_SDK:
     from mcp_types import ElicitResult, InputRequiredResult
 
     from mcp_upload.adapters.mcp import ask_for_upload
+    from mcp_upload.adapters.mcp_extension import IDENTIFIER, UploadTicketExtension
 
 
 @pytest.fixture
@@ -202,3 +203,30 @@ async def test_fastmcp_adapter(gateway: UploadGateway, upstream: Upstream) -> No
     server = FastMCP("adapter-test")
     attach(server, gateway)
     await round_trip(server.http_app(), gateway, upstream)
+
+
+@pytest.mark.skipif(not HAS_OFFICIAL_SDK, reason="official SDK not installed")
+def test_extension_is_advertised_in_server_capabilities() -> None:
+    """A client has no other way to discover that this server takes files.
+
+    Uploads work whether or not the extension is declared, so this only proves the
+    capability is reachable, which is the entire point of declaring it.
+    """
+    server = MCPServer("files", extensions=[UploadTicketExtension()])
+    # Reaching through to the low-level server on purpose. MCPServer exposes no public
+    # accessor for the capabilities it will send, and asserting on the real object is
+    # worth more than asserting on our own settings dict. If the SDK renames this, the
+    # test fails loudly, which is the outcome we want.
+    capabilities = server._lowlevel_server.get_capabilities()
+    assert capabilities.extensions is not None
+    assert IDENTIFIER in capabilities.extensions
+    assert capabilities.extensions[IDENTIFIER]["transport"] == "multipart-form-data"
+
+
+@pytest.mark.skipif(not HAS_OFFICIAL_SDK, reason="official SDK not installed")
+def test_extension_identifier_carries_a_reverse_dns_prefix() -> None:
+    """SEP-2133 requires it, and the SDK enforces it at subclass definition time."""
+    from mcp.shared.extension import validate_extension_identifier
+
+    validate_extension_identifier(IDENTIFIER, owner="UploadTicketExtension")
+    assert IDENTIFIER.count("/") == 1

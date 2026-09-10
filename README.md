@@ -224,6 +224,27 @@ minted across both rounds. This needs a client that supports URL-mode elicitatio
 The official SDK's `Client` does, most chat hosts do not yet, and the plain
 `request_upload` tool above works regardless.
 
+### Advertising it as an extension
+
+A client can read a tool description in prose, but nothing machine-readable otherwise
+says "this server hands out upload tickets". The 2026-07-28 protocol added an
+`extensions` capability for that, and SEP-2133 requires a reverse-DNS prefix on every
+identifier. Opt in when you build the server:
+
+```python
+from mcp.server.mcpserver import MCPServer
+from mcp_upload.adapters.mcp import attach
+from mcp_upload.adapters.mcp_extension import UploadTicketExtension
+
+server = MCPServer("files", extensions=[UploadTicketExtension()])
+attach(server, gateway)
+```
+
+That advertises `me.imaadkhan/upload-ticket` under `ServerCapabilities.extensions`.
+It contributes no tools and intercepts nothing, so uploads behave identically whether
+or not it is declared. It is discovery, not a feature gate, and no client looks for it
+today.
+
 ## Where the bytes go
 
 A `Destination` is an HTTP endpoint you declare at startup. `url` may contain `{id}`
@@ -273,14 +294,40 @@ place the outcome could live. A record here moves `issued` to `redeemed` to
 so "did that upload finish?" has an answer. Redemption stops being allowed at
 `expires_at` (15 minutes by default). The two clocks are independent.
 
-Two stores ship. `MemoryStore` is for one process and for tests. It is correct under
-concurrency only because its redeem does the read, check and write with no `await`
-in between, and it has a record cap so ticket issuance cannot grow memory without
-bound. `SqliteStore` is for one host with several workers: redemption is one
-conditional `UPDATE` whose `WHERE` clause carries the status and expiry checks, so
-the database serializes competing writers and exactly one sees a row change. Both
-were checked with fifty concurrent redemptions of one ticket and one winner. The
-`Store` protocol is six methods. Bring your own for anything else.
+Three stores ship, each using the strongest primitive its engine offers.
+`MemoryStore` is for one process and for tests. It is correct under concurrency only
+because its redeem does the read, check and write with no `await` in between, and it
+has a record cap so ticket issuance cannot grow memory without bound. `SqliteStore` is
+for one host with several workers: redemption is one conditional `UPDATE` whose `WHERE`
+clause carries the status and expiry checks, so the database serializes competing
+writers and exactly one sees a row change. `RedisStore` is for a server behind a load
+balancer, where the upload almost never arrives at the replica that issued the ticket:
+redemption is a Lua script, because no single Redis command does compare-and-swap on a
+hash field. All three were checked with fifty concurrent redemptions of one ticket and
+one winner. The `Store` protocol is six methods. Bring your own for anything else.
+
+`RedisStore` needs the extra and an explicit import, so `import mcp_upload` never
+requires `redis`:
+
+```
+pip install "mcp-upload[mcp,redis]"
+```
+
+```python
+from redis.asyncio import Redis
+from mcp_upload.redis_store import RedisStore
+
+store = RedisStore(Redis.from_url("redis://localhost:6379/0"))
+```
+
+Two things it does deliberately. The Redis key TTL is the retention window and never
+the redemption deadline, because expiring the key at the redemption deadline is what
+forces you back into destroy-on-read and throws away the record that answers "did that
+upload finish?". And the script only ever writes the status and timestamp fields, never
+the record as a whole, so a decode and re-encode in Lua cannot quietly rewrite an empty
+`accept` list into an empty object. Its tests run against fakeredis by default and
+against a real Redis in CI, because a store whose one job is atomicity should not be
+certified by a simulator alone.
 
 ## What the endpoint refuses, and when
 
@@ -393,9 +440,11 @@ Vulnerabilities go through GitHub's private reporting on this repository. See
 Upload only. Server-to-client delivery is already covered by MCP resources. One file
 per ticket. No resumable or chunked uploads. No content sniffing: the accept list is
 checked against the declared type, and that is a policy check, not a security
-guarantee. No storage of its own: bytes go to your backend and nowhere else. A Redis
-store and the proposal-shaped `files/authorizeUpload` adapter are planned. The
-`Store` protocol and the stable record URI are the seams for them.
+guarantee. No storage of its own: bytes go to your backend and nowhere else. The
+proposal-shaped `files/authorizeUpload` adapter is planned, and the stable record URI
+is the seam for it. The Tasks extension tier is not built: the official SDK's 2.2.0
+release notes still list SEP-2663 as unimplemented, so there is nothing to negotiate
+against yet.
 
 ## Running the example
 

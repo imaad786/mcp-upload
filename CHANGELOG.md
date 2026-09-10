@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.0 (2026-09-09)
+
+- **`RedisStore`**, for a server running behind a load balancer, where an upload almost
+  never arrives at the replica that issued the ticket. Redemption is a Lua script,
+  because no single Redis command does compare-and-swap on a hash field. Install with
+  the new `redis` extra and import it explicitly from `mcp_upload.redis_store`, so
+  `import mcp_upload` never requires `redis`. The key TTL is the retention window and
+  never the redemption deadline, and the script writes only the status and timestamp
+  fields, never the record as a whole. Its tests run against fakeredis locally and
+  against a real Redis service in CI.
+- **`UploadTicketExtension`**, which advertises `me.imaadkhan/upload-ticket` under
+  `ServerCapabilities.extensions` so a client can discover that a server takes files.
+  Reverse-DNS prefix per SEP-2133. It contributes no tools and intercepts nothing, so
+  uploads behave the same whether or not it is declared.
+
 ## 0.1.3 (2026-08-31)
 
 Documentation only. No code changes, no API changes.
