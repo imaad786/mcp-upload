@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-10-03)
 
 - **The `fastmcp` extra now requires FastMCP 4.x** (`fastmcp>=4,<5`). FastMCP 4.x builds
   on the official SDK 2.x, so the `mcp` and `fastmcp` extras can now be installed
