@@ -17,7 +17,15 @@ import httpx
 import pytest
 from starlette.applications import Starlette
 
-from mcp_upload import Issued, MemoryStore, Registry, Status, UnknownDestination, UploadGateway
+from mcp_upload import (
+    Issued,
+    MemoryStore,
+    Record,
+    Registry,
+    Status,
+    UnknownDestination,
+    UploadGateway,
+)
 from mcp_upload.multipart import parse_content_type, sanitize_filename
 from tests.conftest import BASE_URL, Upstream, multipart
 
@@ -522,3 +530,42 @@ def test_sanitize_filename(value: str | None, expected: str) -> None:
 
 async def test_record_states_are_the_documented_set() -> None:
     assert [s.value for s in Status] == ["issued", "redeemed", "completed", "failed", "claimed"]
+
+
+async def test_on_complete_sees_every_terminal_record_after_the_response(
+    upstream: Upstream, registry: Registry
+) -> None:
+    seen: list[tuple[str, Status, str | None]] = []
+
+    async def hook(record: Record) -> None:
+        seen.append((record.id, record.status, record.outcome.error if record.outcome else None))
+
+    async def broken(record: Record) -> None:
+        raise RuntimeError("hook failure must not affect the upload")
+
+    expected: list[tuple[str, Status, str | None]] = []
+    for callback in (hook, broken):
+        http = httpx.AsyncClient(transport=httpx.MockTransport(upstream.handler))
+        gw = UploadGateway(
+            base_url=BASE_URL,
+            registry=registry,
+            store=MemoryStore(),
+            http=http,
+            on_complete=callback,
+        )
+        app = Starlette(routes=gw.routes())
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url=BASE_URL
+        ) as client:
+            ok = await issue(gw)
+            big = await issue(gw)
+            r1 = await post(client, ok.upload_url, [("file", "a.txt", b"hello", "text/plain")])
+            r2 = await post(client, big.upload_url, [("file", "b.bin", b"x" * 2000, None)])
+            assert (r1.status_code, r2.status_code) == (200, 413)
+        if callback is hook:
+            expected = [
+                (ok.record.id, Status.COMPLETED, None),
+                (big.record.id, Status.FAILED, "too_large"),
+            ]
+        await http.aclose()
+    assert seen == expected

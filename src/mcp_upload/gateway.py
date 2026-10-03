@@ -28,14 +28,15 @@ import hashlib
 import logging
 import re
 import secrets
-from collections.abc import AsyncIterator, Callable
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
-from starlette.background import BackgroundTask
+from starlette.background import BackgroundTasks
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
@@ -47,6 +48,7 @@ from . import page
 from .destinations import Destination, Registry, UnknownDestination
 from .multipart import Framer, boundary_of, multipart_error, sanitize_filename
 from .store import Store, StoreFull
+from .telemetry import Telemetry
 from .tickets import (
     ClaimError,
     Constraints,
@@ -89,6 +91,12 @@ _MAX_OVERHEAD = 512 * 1024
 _FEED_SLICE = 256 * 1024
 _MAX_PREAMBLE = 16 * 1024
 _MAX_EPILOGUE = 64 * 1024
+
+# File data is handed to the backend in pieces of at least this size. Clients and
+# proxies often deliver 16 KiB at a time, and every piece costs a queue hand-off and a
+# socket write upstream, so small reads are joined first. Reads already this large go
+# through untouched.
+_COALESCE = 256 * 1024
 
 # Every failure the endpoint can report, and the HTTP status it maps to. Backend error
 # text is never passed through; a backend failure becomes one of these codes.
@@ -181,6 +189,8 @@ class UploadGateway:
         stall_timeout: timedelta | None = timedelta(seconds=30),
         stall_min_bytes: int = 64 * 1024,
         upload_timeout: timedelta | None = timedelta(hours=1),
+        on_complete: Callable[[Record], Awaitable[None]] | None = None,
+        telemetry: bool = True,
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         """
@@ -208,6 +218,14 @@ class UploadGateway:
         slow backend. Without this, a client sending a byte every few seconds holds a
         slot and a backend connection indefinitely. ``upload_timeout`` bounds the
         whole upload from redemption to the last byte. ``None`` disables either.
+
+        ``on_complete`` is awaited with the final record of every redeemed upload,
+        completed or failed, after the response has gone to the uploader, so a server
+        can start work on a file without polling. An exception it raises is logged and
+        does not affect the upload.
+
+        ``telemetry`` emits OpenTelemetry traces and metrics when the API is installed
+        and the application has configured an SDK. See ``mcp_upload.telemetry``.
         """
         if ttl <= timedelta(0):
             raise ValueError("ttl must be positive")
@@ -238,6 +256,8 @@ class UploadGateway:
         self._stall_timeout = None if stall_timeout is None else stall_timeout.total_seconds()
         self._stall_min_bytes = stall_min_bytes
         self._upload_timeout = None if upload_timeout is None else upload_timeout.total_seconds()
+        self._on_complete = on_complete
+        self._telemetry = Telemetry(telemetry)
         self._clock = clock
         self._transport = urlsplit(self._base_url).scheme or "https"
 
@@ -316,6 +336,7 @@ class UploadGateway:
             owner=owner,
         )
         await self._store.put(record)
+        self._telemetry.issued(dest.name)
         logger.info("issued %s for destination %s", record.id, dest.name)
         return Issued(record=record, secret=secret, upload_url=self.upload_url(secret))
 
@@ -420,6 +441,7 @@ class UploadGateway:
         if request.method == "GET":
             return await self._render_form(request, secret)
         response = await self._ingest(request, secret)
+        after = BackgroundTasks()
         meter = getattr(request.state, "mcp_upload_meter", None)
         if meter is None or not meter.body_done:
             # Refused before the body was read to its end. Closing a socket with unread
@@ -427,7 +449,12 @@ class UploadGateway:
             # the client reads it, so a 503 or 413 arrives as "connection reset" and the
             # client cannot tell what happened. Reading a bounded amount after the
             # response is sent gives the client time to see the answer and stop.
-            response.background = BackgroundTask(_drain, request.receive)
+            after.add_task(_drain, request.receive)
+        final = getattr(request.state, "mcp_upload_final", None)
+        if self._on_complete is not None and final is not None:
+            after.add_task(_notify, self._on_complete, final)
+        if after.tasks:
+            response.background = after
         return response
 
     async def _render_form(self, request: Request, secret: str) -> Response:
@@ -499,10 +526,20 @@ class UploadGateway:
             return self._error_response(request, record, code)
 
         # Steps 4 and 5.
-        status, outcome = await self._forward(request, redeemed, dest)
+        started = time.monotonic()
+        with self._telemetry.upload(redeemed.id, dest.name) as span:
+            status, outcome = await self._forward(request, redeemed, dest)
+            self._telemetry.finished(
+                span,
+                dest.name,
+                "completed" if status is Status.COMPLETED else outcome.error or "internal",
+                outcome.size,
+                time.monotonic() - started,
+            )
         final = await self._store.finish(redeemed.id, status, outcome, self._clock())
         if final is None:
             final = redeemed.finished(status, outcome, self._clock())
+        request.state.mcp_upload_final = final
         if status is Status.COMPLETED:
             logger.info("completed %s: %d bytes to %s", final.id, outcome.size, dest.name)
             return self._success_response(request, final)
@@ -631,6 +668,8 @@ class UploadGateway:
         details: dict[str, Any] | None = None,
     ) -> Response:
         http_status = ERROR_STATUS.get(code, 500)
+        if record is None or record.status is Status.ISSUED:
+            self._telemetry.refused(code)
         body: dict[str, Any] = {"status": "failed", "error": code}
         if record is not None:
             body["id"] = record.id
@@ -681,6 +720,8 @@ class _FileTarget(BaseTarget):
         self.hasher = hashlib.sha256()
         self.done = False
         self._announced = False
+        self._pending: list[bytes] = []
+        self._pending_size = 0
 
     async def on_start_async(self) -> None:
         self.parts += 1
@@ -749,7 +790,21 @@ class _FileTarget(BaseTarget):
                 details={"reason": "maxSizeExceeded", "maxSize": limit, "receivedSize": self.size},
             )
         self.hasher.update(chunk)
-        await self._queue.put(bytes(chunk))
+        if not self._pending and len(chunk) >= _COALESCE:
+            await self._queue.put(bytes(chunk))
+            return
+        self._pending.append(bytes(chunk))
+        self._pending_size += len(chunk)
+        if self._pending_size >= _COALESCE:
+            await self._flush()
+
+    async def _flush(self) -> None:
+        if not self._pending:
+            return
+        data = self._pending[0] if len(self._pending) == 1 else b"".join(self._pending)
+        self._pending = []
+        self._pending_size = 0
+        await self._queue.put(data)
 
     def verify(self) -> None:
         """Check the complete file against what the uploader declared, if anything."""
@@ -781,6 +836,7 @@ class _FileTarget(BaseTarget):
         # it is known that nothing objectionable followed the file part. A backend then
         # only commits an upload whose entire request validated.
         self._announce()
+        await self._flush()
         self.done = True
 
 
@@ -980,6 +1036,13 @@ def _expected_sha256(digest: FileDigest | str | None) -> str | None:
 
 def _visible(record: Record, owner: str | None) -> bool:
     return owner is None or record.owner is None or record.owner == owner
+
+
+async def _notify(hook: Callable[[Record], Awaitable[None]], record: Record) -> None:
+    try:
+        await hook(record)
+    except Exception:
+        logger.exception("on_complete hook failed for %s", record.id)
 
 
 async def _drain(receive: Any, limit: int = 1 << 20, timeout: float = 2.0) -> None:

@@ -49,6 +49,9 @@ fastmcp = ["fastmcp>=4,<5"]
 # Optional ticket store for servers running behind a load balancer. Imported only
 # through mcp_upload.redis_store, so the package root never needs it.
 redis = ["redis>=5.0"]
+# Traces and metrics. The official SDK already depends on the API; this extra is for
+# servers on FastMCP or elsewhere that want them without it.
+otel = ["opentelemetry-api>=1.20"]
 dev = [
   "pytest>=8.3",
   "pytest-asyncio>=0.24",
