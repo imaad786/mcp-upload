@@ -1,8 +1,8 @@
 """The adapters register the endpoint on a real server object from each framework.
 
-The two frameworks cannot be installed together (fastmcp 3.x pins the official SDK
-below 2.0), so each test runs where its framework is present and is skipped elsewhere.
-CI has one lane per framework, so both run there.
+Each test runs where its framework is present and is skipped elsewhere. fastmcp 4.x
+pulls in the official SDK, so the fastmcp lane in CI runs every test, and the mcp lane
+runs all but the FastMCP one.
 """
 
 from __future__ import annotations

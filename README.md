@@ -9,7 +9,7 @@ about the file ever travels through MCP except a reference to it. No change to t
 protocol is needed, and no host has to know the library exists.
 
 Targets protocol revision 2026-07-28. Works with the official Python SDK (`mcp` 2.x)
-and with FastMCP (`fastmcp` 3.x). Python 3.11 or later. Apache 2.0.
+and with FastMCP (`fastmcp` 4.x). Python 3.11 or later. Apache 2.0.
 
 ## The problem
 
@@ -101,12 +101,11 @@ picker for MCP. The browser page exists so the pattern works everywhere anyway.
 
 ```
 pip install "mcp-upload[mcp]"        # official SDK, mcp 2.x
-pip install "mcp-upload[fastmcp]"    # FastMCP 3.x
+pip install "mcp-upload[fastmcp]"    # FastMCP 4.x
 ```
 
-The two extras cannot be installed together. FastMCP 3.x pins the official SDK below
-2.0, and the `mcp` extra targets 2.x. Pick the one your server uses. The core has no
-dependency on either.
+Pick the one your server uses. FastMCP 4.x builds on the official SDK 2.x, so the two
+can also be installed together. The core has no dependency on either.
 
 ## Use it
 

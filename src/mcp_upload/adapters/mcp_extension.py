@@ -22,8 +22,8 @@ a client that cares can find it. Uploads work exactly the same whether or not it
 declared, so this is discovery rather than a feature gate.
 
 This module lives apart from ``adapters.mcp`` because it has to import from the SDK at
-module scope in order to subclass ``Extension``, and the FastMCP lane pins ``mcp<2``,
-where that module does not exist.
+module scope in order to subclass ``Extension``. ``adapters.mcp`` imports the SDK only
+inside functions and for type checking, so it stays importable without the SDK.
 """
 
 from __future__ import annotations

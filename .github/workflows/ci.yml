@@ -17,8 +17,9 @@ jobs:
       matrix:
         # 3.14 joins the matrix once streaming-form-data publishes a cp314 wheel.
         python-version: ["3.11", "3.12", "3.13"]
-        # One lane per server framework. fastmcp 3.x pins mcp<2, so the two extras
-        # cannot be installed together. Core tests run in both lanes.
+        # One lane per server framework. fastmcp 4.x pulls in the official SDK, so the
+        # fastmcp lane runs every test and the mcp lane proves the official adapter
+        # works without fastmcp installed. Core tests run in both lanes.
         framework: ["mcp", "fastmcp"]
     # The Redis store's tests fall back to fakeredis when this is absent, which keeps
     # the suite runnable with no service. fakeredis reimplements Lua through lupa, and

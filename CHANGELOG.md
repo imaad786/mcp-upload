@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **The `fastmcp` extra now requires FastMCP 4.x** (`fastmcp>=4,<5`). FastMCP 4.x builds
+  on the official SDK 2.x, so the `mcp` and `fastmcp` extras can now be installed
+  together. FastMCP 3.x is no longer supported.
+
 ## 0.2.0 (2026-09-09)
 
 - **`RedisStore`**, for a server running behind a load balancer, where an upload almost

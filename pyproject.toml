@@ -39,13 +39,13 @@ dependencies = [
 
 [project.optional-dependencies]
 # Each adapter is a thin registration of the same core handler on a server instance.
-# The two extras are mutually exclusive: fastmcp 3.x pins the official SDK to mcp<2,
-# while the mcp extra targets SDK 2.x. Install one or the other, never both. That is
-# also why neither framework is in the dev extra and why CI runs one lane per framework.
+# fastmcp 4.x builds on the official SDK 2.x, so the two extras can be installed
+# together. Neither framework is in the dev extra, so CI can run one lane per framework
+# and catch an adapter that quietly depends on the other.
 # Upper bounds are deliberate: both frameworks shipped or announced a breaking major
 # release within weeks of this project starting.
 mcp = ["mcp>=2.1,<3"]
-fastmcp = ["fastmcp>=3.4,<5"]
+fastmcp = ["fastmcp>=4,<5"]
 # Optional ticket store for servers running behind a load balancer. Imported only
 # through mcp_upload.redis_store, so the package root never needs it.
 redis = ["redis>=5.0"]
@@ -67,9 +67,6 @@ dev = [
 ]
 
 [tool.uv]
-# The mcp and fastmcp extras cannot be installed together (fastmcp 3.x pins mcp<2).
-# Declaring the conflict lets uv produce one lockfile that covers both lanes.
-conflicts = [[{ extra = "mcp" }, { extra = "fastmcp" }]]
 # The build backend is not covered by the lockfile. Pinning it here means `uv build`
 # in the release workflow uses a known version rather than the newest on the day.
 build-constraint-dependencies = ["hatchling==1.32.0"]
@@ -118,15 +115,6 @@ module = [
   "mcp_types",
 ]
 ignore_missing_imports = true
-
-# The extension adapter subclasses the SDK's Extension base class, which exists only in
-# mcp 2.x. The FastMCP lane pins mcp<2, so in that lane the base class is missing and
-# strict mode would refuse to subclass the resulting Any. The module is six lines of
-# declaration with no logic, so loosening exactly it costs nothing.
-[[tool.mypy.overrides]]
-module = ["mcp.server.extension", "mcp.shared.extension", "mcp_upload.adapters.mcp_extension"]
-ignore_missing_imports = true
-disallow_subclassing_any = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

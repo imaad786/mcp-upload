@@ -1,4 +1,4 @@
-"""Adapter for FastMCP (the ``fastmcp`` package, 3.x)."""
+"""Adapter for FastMCP (the ``fastmcp`` package, 4.x)."""
 
 from __future__ import annotations
 
