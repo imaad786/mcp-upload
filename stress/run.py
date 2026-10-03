@@ -120,8 +120,11 @@ def start(src: str, **gateway_args: Any) -> Stack:
         f"http://127.0.0.1:{bport}",
     ]
     for key, value in gateway_args.items():
-        if value is not None:
-            cmd += [f"--{key.replace('_', '-')}", str(value)]
+        flag = f"--{key.replace('_', '-')}"
+        if value is True:
+            cmd.append(flag)
+        elif value is not None and value is not False:
+            cmd += [flag, str(value)]
     gateway = subprocess.Popen(cmd, env=env)
     wait_port(gport)
     watch = RssWatch(gateway)
@@ -1113,6 +1116,249 @@ async def sqlite_migration(src: str) -> dict[str, Any]:
             "old_record_digest_ok": digest_matches(
                 str(old_status.get("file", {}).get("digest", {}).get("value", "")), old_digest
             ),
+        },
+    )
+
+
+# ----- 0.6.0 features: function destinations, the filesystem sink, raw uploads ----------
+#
+# Like the 0.4.0 scenarios, each asks the gateway for its capabilities first and
+# reports ``{"supported": false}`` on a version that lacks the feature.
+
+
+async def sink_stats(stack: Stack) -> dict[str, Any]:
+    return await get_json(stack.gateway_port, "/_sink_stats")
+
+
+def raw_file_body(size: int, *, seed: int = 0, chunk: int = 256 * 1024) -> tuple[Body, str]:
+    """A streamed raw body of ``size`` pseudo-random bytes and its SHA-256."""
+    block = random.Random(seed).randbytes(min(chunk, max(size, 1)))
+    digest = hashlib.sha256()
+    left = size
+    while left:
+        n = min(len(block), left)
+        digest.update(block[:n])
+        left -= n
+
+    async def gen() -> AsyncIterator[bytes]:
+        left = size
+        while left:
+            n = min(len(block), left)
+            yield block[:n]
+            left -= n
+
+    return gen, digest.hexdigest()
+
+
+def failed_but_kept(results: list[tuple[str, Reply, str | None]], commits: dict[str, Any]) -> int:
+    return sum(
+        1
+        for _, reply, _ in results
+        if reply.body.get("status") != "completed" and reply.body.get("id") in commits
+    )
+
+
+def wrong_bytes(results: list[tuple[str, Reply, str | None]], commits: dict[str, Any]) -> int:
+    return sum(
+        1
+        for _, reply, digest in results
+        if reply.body.get("status") == "completed"
+        and commits.get(reply.body.get("id"), {}).get("sha256") != digest
+    )
+
+
+def by_kind(results: list[tuple[str, Reply, str | None]]) -> dict[str, dict[str, int]]:
+    counts: dict[str, Counter[str]] = {}
+    for kind, reply, _ in results:
+        counts.setdefault(kind, Counter())[
+            reply.body.get("error") or reply.body.get("status") or reply.error or str(reply.status)
+        ] += 1
+    return {k: dict(v) for k, v in counts.items()}
+
+
+@scenario
+async def sink_integrity(src: str) -> dict[str, Any]:
+    """50 concurrent uploads of up to 4 MiB into a function destination, once into an
+    in-process memory sink and once into the filesystem sink. Every completed upload
+    must be committed with exactly its bytes, and no temporary file may remain."""
+    result: dict[str, Any] = {"supported": True}
+    for kind, cap in (("memory", "sink"), ("filesystem", "filesystem_sink")):
+        stack = start(src, sink=kind, max_in_flight=100)
+        caps = await capabilities(stack)
+        if missing := lacking(caps, cap):
+            result[kind] = unsupported(stack, missing)
+            result["supported"] = False
+            continue
+        rng = random.Random(7)
+        bodies = [file_body(rng.randint(1, 4 * MB), seed=300 + i) for i in range(50)]
+        t = time.perf_counter()
+        replies = await asyncio.gather(*(upload(stack, b, retries=10) for b, _ in bodies))
+        wall = time.perf_counter() - t
+        await asyncio.sleep(0.5)
+        stats = await sink_stats(stack)
+        results = [("honest", r, d) for r, (_, d) in zip(replies, bodies, strict=True)]
+        result[kind] = finish(
+            stack,
+            {
+                "sink_active": caps.get("sink_active"),
+                "outcomes": outcomes(list(replies)),
+                "committed": len(stats["commits"]),
+                "completed_but_wrong_or_missing_bytes": wrong_bytes(results, stats["commits"]),
+                "temp_files_left": stats.get("temp_files", 0),
+                "wall_s": round(wall, 1),
+            },
+        )
+    return result
+
+
+@scenario
+async def sink_mixed_failures(src: str) -> dict[str, Any]:
+    """Into the filesystem sink, max_size 4 MiB, at once: 20 honest uploads, 10 clients
+    that vanish mid-body, 10 oversize bodies, 10 declared digests that do not match.
+    No failed upload may leave a file, and no temporary file may remain."""
+    stack = start(src, sink="filesystem", max_size=4 * MB, max_in_flight=100)
+    caps = await capabilities(stack)
+    if missing := lacking(caps, "filesystem_sink"):
+        return unsupported(stack, missing)
+    rng = random.Random(11)
+
+    async def honest(i: int) -> tuple[str, Reply, str | None]:
+        body, digest = file_body(rng.randint(1, 3 * MB), seed=500 + i)
+        return "honest", await upload(stack, body, retries=10, timeout=60), digest
+
+    async def vanish(i: int) -> tuple[str, Reply, str | None]:
+        body, _ = file_body(3 * MB, seed=600 + i)
+        cut = rng.randint(256 * 1024, 2 * MB)
+        return "vanish", await upload(stack, body, retries=10, abort_after=cut), None
+
+    async def oversize(i: int) -> tuple[str, Reply, str | None]:
+        body, _ = file_body(6 * MB, seed=700 + i)
+        return "oversize", await upload(stack, body, retries=10, timeout=60), None
+
+    async def wrong_digest(i: int) -> tuple[str, Reply, str | None]:
+        body, _ = file_body(2 * MB, seed=800 + i)
+        ticket = await issue(stack, expected_digest=b64url_of(hashlib.sha256(b"no").hexdigest()))
+        return "wrong_digest", await send(stack, ticket, body, timeout=60), None
+
+    kinds = [honest] * 20 + [vanish] * 10 + [oversize] * 10 + [wrong_digest] * 10
+    rng.shuffle(kinds)
+    results = await asyncio.gather(*(k(i) for i, k in enumerate(kinds)))
+    # A vanished client is noticed when its next read fails, and a write still running
+    # in a thread is cleaned up after it returns, so give both a moment.
+    await asyncio.sleep(1.5)
+    stats = await sink_stats(stack)
+    commits = stats["commits"]
+    vanished = [
+        (await status_of(stack, reply.body["id"])).get("error")
+        for kind, reply, _ in results
+        if kind == "vanish"
+    ]
+    return finish(
+        stack,
+        {
+            "supported": True,
+            "outcomes_by_kind": by_kind(list(results)),
+            "vanished_records": dict(Counter(vanished)),
+            "files_committed": len(commits),
+            "honest_completed": sum(
+                k == "honest" and r.body.get("status") == "completed" for k, r, _ in results
+            ),
+            "completed_but_wrong_or_missing_bytes": wrong_bytes(list(results), commits),
+            "failed_but_file_present": failed_but_kept(list(results), commits),
+            "temp_files_left": stats["temp_files"],
+        },
+    )
+
+
+@scenario
+async def raw_uploads(src: str) -> dict[str, Any]:
+    """Raw-body uploads, max_size 4 MiB, to the HTTP backend: 30 honest ones (POST and
+    PUT, filename from Content-Disposition or the query), then refusals: declared length
+    over the limit, chunked bodies over it, wrong declared digests, a wrong media type,
+    URL-encoded forms and clients that vanish. Checks the bytes, the names, which
+    refusals left the ticket unspent, and that nothing refused was committed."""
+    stack = start(src, raw_uploads=True, max_size=4 * MB, max_in_flight=100)
+    caps = await capabilities(stack)
+    if missing := lacking(caps, "raw_uploads"):
+        return unsupported(stack, missing)
+    rng = random.Random(13)
+    port = stack.gateway_port
+
+    async def honest(i: int) -> tuple[str, Reply, str | None]:
+        body, digest = raw_file_body(rng.randint(0, 2 * MB), seed=900 + i)
+        ticket = await issue(stack)
+        name = f"raw {i}.bin"
+        headers = {"Content-Type": "application/octet-stream"}
+        path = ticket["path"]
+        if i % 2:
+            path += f"?filename=raw%20{i}.bin"
+        else:
+            headers["Content-Disposition"] = f"attachment; filename*=UTF-8''raw%20{i}.bin"
+        method = "PUT" if i % 3 else "POST"
+        reply = await http(port, method, path, headers=headers, body=body, timeout=60)
+        reply.body.setdefault("id", ticket["id"])
+        reply.body["name_ok"] = reply.body.get("file", {}).get("name") == name
+        return "honest", reply, digest
+
+    async def refused(
+        kind: str, body: Body | bytes, headers: dict[str, str], **issue_kw: Any
+    ) -> tuple[str, Reply, str | None]:
+        ticket = await issue(stack, **issue_kw)
+        reply = await http(port, "PUT", ticket["path"], headers=headers, body=body, timeout=60)
+        reply.body.setdefault("id", ticket["id"])
+        reply.body["record_after"] = (await status_of(stack, ticket["id"])).get("status")
+        return kind, reply, None
+
+    octet = {"Content-Type": "application/octet-stream"}
+    jobs: list[Awaitable[tuple[str, Reply, str | None]]] = [honest(i) for i in range(30)]
+    jobs += [refused("declared_oversize", b"x" * (5 * MB), octet) for _ in range(5)]
+    jobs += [refused("chunked_oversize", raw_file_body(6 * MB, seed=i)[0], octet) for i in range(5)]
+    wrong = b64url_of(hashlib.sha256(b"not this").hexdigest())
+    jobs += [
+        refused("wrong_digest", raw_file_body(MB, seed=i)[0], octet, expected_digest=wrong)
+        for i in range(5)
+    ]
+    jobs += [
+        refused("text_into_images", b"hello", {"Content-Type": "text/plain"}, destination="images")
+        for _ in range(3)
+    ]
+    form = {"Content-Type": "application/x-www-form-urlencoded"}
+    jobs += [refused("urlencoded", b"file=hello", form) for _ in range(3)]
+
+    async def vanish(i: int) -> tuple[str, Reply, str | None]:
+        ticket = await issue(stack)
+        body, _ = raw_file_body(3 * MB, seed=950 + i)
+        cut = rng.randint(256 * 1024, 2 * MB)
+        reply = await http(port, "PUT", ticket["path"], headers=octet, body=body, abort_after=cut)
+        reply.body.setdefault("id", ticket["id"])
+        return "vanish", reply, None
+
+    jobs += [vanish(i) for i in range(5)]
+    results = await asyncio.gather(*jobs)
+    await asyncio.sleep(1)
+    commits = (await backend(stack))["commits"]
+    records_after: dict[str, Counter[str]] = {}
+    for kind, reply, _ in results:
+        if kind == "vanish":
+            reply.body["record_after"] = (await status_of(stack, reply.body["id"])).get("error")
+        if kind != "honest":
+            records_after.setdefault(kind, Counter())[str(reply.body.get("record_after"))] += 1
+    return finish(
+        stack,
+        {
+            "supported": True,
+            "outcomes_by_kind": by_kind(list(results)),
+            "http_status_by_kind": {
+                kind: dict(Counter(r.status for k, r, _ in results if k == kind))
+                for kind in dict.fromkeys(k for k, _, _ in results)
+            },
+            "record_after_refusal": {k: dict(v) for k, v in records_after.items()},
+            "honest_names_ok": sum(
+                bool(r.body.get("name_ok")) for k, r, _ in results if k == "honest"
+            ),
+            "completed_but_wrong_or_missing_bytes": wrong_bytes(list(results), commits),
+            "failed_but_committed": failed_but_kept(list(results), commits),
+            "backend_commits": len(commits),
         },
     )
 

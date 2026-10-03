@@ -5,13 +5,15 @@ The order of operations on a POST is the whole design:
 1. Header-only checks: content type, boundary, and a declared size that is obviously
    too large. These cost nothing and run before the ticket is touched, so a request
    that could never carry a file cannot spend a single-use ticket.
-2. Read the record without changing it, to learn the destination and its limits.
+2. Read the record without changing it, to learn the destination and its limits. A raw
+   upload's media type is checked against the accept list here, since it is a header.
 3. Flip the record from issued to redeemed, atomically, in the store. Exactly one
    request wins. Everyone else gets 410.
-4. Only now consume the body. The multipart stream is parsed incrementally, the size
-   limit is enforced on the bytes actually seen, the bytes are hashed, and they are
-   forwarded to the destination through a bounded queue so a slow backend throttles
-   the client instead of filling memory. Nothing is written to disk.
+4. Only now consume the body. A multipart stream is parsed incrementally (a raw body is
+   the file as it stands), the size limit is enforced on the bytes actually seen, the
+   bytes are hashed, and they are forwarded to the destination through a bounded queue
+   so a slow backend or sink throttles the client instead of filling memory. The
+   gateway itself writes nothing to disk.
 5. Record the terminal state on the surviving record so it can be looked up later.
 
 The endpoint asks for no session, header or OAuth token. The ticket is the
@@ -29,7 +31,7 @@ import logging
 import re
 import secrets
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -46,7 +48,16 @@ from streaming_form_data.targets import BaseTarget
 
 from . import page
 from .destinations import Destination, Registry, UnknownDestination
-from .multipart import Framer, boundary_of, multipart_error, sanitize_filename
+from .multipart import (
+    Framer,
+    boundary_of,
+    filename_from_disposition,
+    multipart_error,
+    parse_content_type,
+    raw_body_allowed,
+    sanitize_filename,
+)
+from .sinks import IncomingFile, UploadAborted
 from .store import Store, StoreFull
 from .telemetry import Telemetry
 from .tickets import (
@@ -124,6 +135,7 @@ ERROR_STATUS: dict[str, int] = {
     "upstream_unreachable": 502,
     "upstream_rejected": 502,
     "upstream_closed_early": 502,
+    "sink_failed": 502,
     "store_full": 503,
     "misconfigured": 500,
     "internal": 500,
@@ -191,6 +203,7 @@ class UploadGateway:
         upload_timeout: timedelta | None = timedelta(hours=1),
         on_complete: Callable[[Record], Awaitable[None]] | None = None,
         telemetry: bool = True,
+        raw_uploads: bool = False,
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         """
@@ -226,6 +239,14 @@ class UploadGateway:
 
         ``telemetry`` emits OpenTelemetry traces and metrics when the API is installed
         and the application has configured an SDK. See ``mcp_upload.telemetry``.
+
+        ``raw_uploads`` also accepts a POST or PUT whose body is the file itself, for
+        clients that find a raw body easier than a form (``curl -T``, an S3-style
+        uploader). The media type is the request's Content-Type and the filename comes
+        from a Content-Disposition request header or a ``filename`` query parameter.
+        Every limit applies as it does to a form upload. A URL-encoded form body is
+        never taken as a file. Off by default, and then anything but
+        ``multipart/form-data`` is refused as before.
         """
         if ttl <= timedelta(0):
             raise ValueError("ttl must be positive")
@@ -258,6 +279,7 @@ class UploadGateway:
         self._upload_timeout = None if upload_timeout is None else upload_timeout.total_seconds()
         self._on_complete = on_complete
         self._telemetry = Telemetry(telemetry)
+        self._raw_uploads = raw_uploads
         self._clock = clock
         self._transport = urlsplit(self._base_url).scheme or "https"
 
@@ -346,17 +368,42 @@ class UploadGateway:
     def uri(self, record_id: str) -> str:
         return f"mcp-file://{self._server_name}/{record_id}"
 
-    def describe(self, issued: Issued) -> AwaitingUpload:
+    def describe(
+        self, issued: Issued, *, raw: bool = False, media_type: str | None = None
+    ) -> AwaitingUpload:
         """The tool result for "send the file here". Shaped like SEP-2631's transfer
-        descriptor so the wire format survives the proposal landing."""
+        descriptor so the wire format survives the proposal landing.
+
+        By default it describes a multipart form POST, which every client can send.
+        ``raw=True`` describes a raw-body PUT instead, with no ``multipart`` key, and
+        needs a gateway built with ``raw_uploads=True``. Its ``headers`` carry the
+        Content-Type to send when one is known: ``media_type`` if given, else the
+        ticket's accept list when that names exactly one type.
+        """
         record = issued.record
-        upload: FileTransferDescriptor = {
-            "transport": self._transport,
-            "method": "POST",
-            "url": issued.upload_url,
-            "multipart": {"fileField": self._field},
-            "expiresAt": _iso(record.expires_at),
-        }
+        upload: FileTransferDescriptor
+        if raw:
+            if not self._raw_uploads:
+                raise ValueError("raw uploads are not enabled on this gateway")
+            content_type = media_type or _single_type(record.constraints.accept)
+            if content_type is not None and not record.constraints.allows(content_type):
+                raise ValueError(f"media type {content_type!r} is not accepted by this ticket")
+            upload = {
+                "transport": self._transport,
+                "method": "PUT",
+                "url": issued.upload_url,
+                "expiresAt": _iso(record.expires_at),
+            }
+            if content_type is not None:
+                upload["headers"] = {"Content-Type": content_type}
+        else:
+            upload = {
+                "transport": self._transport,
+                "method": "POST",
+                "url": issued.upload_url,
+                "multipart": {"fileField": self._field},
+                "expiresAt": _iso(record.expires_at),
+            }
         file: FileValue = {"uri": self.uri(record.id)}
         if record.constraints.expected_size is not None:
             file["size"] = record.constraints.expected_size
@@ -434,7 +481,8 @@ class UploadGateway:
     # ----- the HTTP endpoint -------------------------------------------------------
 
     def routes(self) -> list[Route]:
-        return [Route(f"{self._path}/{{ticket}}", self.handle, methods=["GET", "POST"])]
+        methods = ["GET", "POST", "PUT"] if self._raw_uploads else ["GET", "POST"]
+        return [Route(f"{self._path}/{{ticket}}", self.handle, methods=methods)]
 
     async def handle(self, request: Request) -> Response:
         secret = str(request.path_params["ticket"])
@@ -469,18 +517,25 @@ class UploadGateway:
             return _html(page.message("Link already used", "This link has been used."), 410)
         if record.expired(now):
             return _html(page.message("Link expired", "Ask for a new upload link."), 410)
+        # A fresh nonce per response lets the page's one inline script run while the
+        # policy still refuses every other script, inline or external.
+        nonce = secrets.token_urlsafe(18)
         body = page.form(
             action=request.url.path,
             field_name=self._field,
             accept=record.constraints.accept,
             max_size=record.constraints.max_size,
             expires_at=_iso(record.expires_at),
+            nonce=nonce,
         )
-        return _html(body, 200)
+        return _html(body, 200, csp=_form_policy(nonce))
 
     async def _ingest(self, request: Request, secret: str) -> Response:
         # Steps 1 and 2: nothing here touches the ticket.
         code = multipart_error(request.headers)
+        raw = False
+        if code == "not_multipart" and self._raw_uploads and raw_body_allowed(request.headers):
+            raw, code = True, None
         if code is not None:
             return self._error_response(request, None, code)
         # The slot is taken before the first await. Checking here and counting later
@@ -490,11 +545,11 @@ class UploadGateway:
             return self._error_response(request, None, "too_many_uploads")
         self._in_flight += 1
         try:
-            return await self._ingest_in_slot(request, secret)
+            return await self._ingest_in_slot(request, secret, raw)
         finally:
             self._in_flight -= 1
 
-    async def _ingest_in_slot(self, request: Request, secret: str) -> Response:
+    async def _ingest_in_slot(self, request: Request, secret: str, raw: bool) -> Response:
         ticket_hash = hash_secret(secret)
         now = self._clock()
         record = await self._store.get_by_hash(ticket_hash)
@@ -506,13 +561,24 @@ class UploadGateway:
             return self._error_response(request, record, "ticket_expired")
 
         # The multipart envelope adds a little to the file size. Reject only what is
-        # clearly over; the exact check happens on the bytes as they stream.
+        # clearly over; the exact check happens on the bytes as they stream. A raw body
+        # is the file, so its declared length is held to the limit exactly.
         limit = record.constraints.max_size
         declared = request.headers.get("content-length")
-        if limit is not None and declared and declared.isdigit() and int(declared) > limit + 65536:
+        slack = 0 if raw else 65536
+        if limit is not None and declared and declared.isdigit() and int(declared) > limit + slack:
             return self._error_response(
                 request, record, "too_large", {"reason": "maxSizeExceeded", "maxSize": limit}
             )
+
+        # A raw upload names its type and filename in headers, so the type is checked
+        # before the ticket is spent rather than after, as a form part's must be.
+        raw_file: tuple[str, str] | None = None
+        if raw:
+            try:
+                raw_file = _raw_file(request, record.constraints)
+            except UploadError as exc:
+                return self._error_response(request, record, exc.code, exc.details)
 
         try:
             dest = self._registry.get(record.destination)
@@ -528,7 +594,7 @@ class UploadGateway:
         # Steps 4 and 5.
         started = time.monotonic()
         with self._telemetry.upload(redeemed.id, dest.name) as span:
-            status, outcome = await self._forward(request, redeemed, dest)
+            status, outcome = await self._forward(request, redeemed, dest, raw_file)
             self._telemetry.finished(
                 span,
                 dest.name,
@@ -549,18 +615,20 @@ class UploadGateway:
     # ----- streaming ---------------------------------------------------------------
 
     async def _forward(
-        self, request: Request, record: Record, dest: Destination
+        self, request: Request, record: Record, dest: Destination, raw: tuple[str, str] | None
     ) -> tuple[Status, Outcome]:
         queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=self._queue_size)
         state = _PumpState()
         target = _FileTarget(queue, record.constraints, state)
-        parser = StreamingFormDataParser(headers=request.headers, strict=True)
-        parser.register(self._field, target)
-        framer = Framer(boundary_of(request.headers), max_preamble=_MAX_PREAMBLE)
+        body: _MultipartBody | _RawBody = (
+            _MultipartBody(request.headers, self._field, target)
+            if raw is None
+            else _RawBody(target, *raw)
+        )
         meter = _Meter()
         request.state.mcp_upload_meter = meter
         pump = asyncio.create_task(
-            _pump(request, parser, target, queue, state, framer, meter, self._stall_min_bytes)
+            _pump(request, body, target, queue, state, meter, self._stall_min_bytes)
         )
         watchdog = asyncio.create_task(
             _watch(
@@ -582,52 +650,28 @@ class UploadGateway:
                 waiter.cancel()
             if state.error is not None or target.filename is None:
                 # The body failed before a usable file part appeared. No upstream
-                # request is opened, so the backend never sees a phantom upload.
+                # request is opened and no sink is called, so the destination never
+                # sees a phantom upload.
                 if not pump.done():
                     await pump
                 raise state.error or UploadError("missing_file", "no file part in the body")
 
             filename = target.filename or "upload"
             media_type = target.media_type or "application/octet-stream"
-            url = dest.build_url(record.id, filename)
-            headers, body = _upstream(dest, filename, media_type, queue, state)
-            try:
-                response = await self._http.request(
-                    dest.method, url, content=body, headers=headers, timeout=dest.timeout
-                )
-            except UploadError:
-                raise
-            except httpx.HTTPError as exc:
-                raise UploadError("upstream_unreachable", str(exc)) from exc
-
-            if not pump.done():
-                # The backend answered before the whole body was forwarded. There is no
-                # sensible way to continue, so stop reading and report it.
-                pump.cancel()
-                with contextlib.suppress(BaseException):
-                    await pump
-                if 200 <= response.status_code < 300:
-                    raise UploadError(
-                        "upstream_closed_early",
-                        "backend accepted before the upload finished",
-                        upstream_status=response.status_code,
-                    )
-            elif not pump.cancelled():
-                await pump
-            if state.error is not None:
-                raise state.error
-            if not 200 <= response.status_code < 300:
-                raise UploadError(
-                    "upstream_rejected",
-                    f"backend returned {response.status_code}",
-                    upstream_status=response.status_code,
+            stream = _Stream(queue, state)
+            upstream_status: int | None = None
+            if dest.sink is not None:
+                await self._to_sink(dest, record, filename, media_type, stream, pump)
+            else:
+                upstream_status = await self._to_http(
+                    dest, record, filename, media_type, stream, pump
                 )
             return Status.COMPLETED, Outcome(
                 size=target.size,
                 filename=filename,
                 media_type=media_type,
                 sha256=target.hasher.hexdigest(),
-                upstream_status=response.status_code,
+                upstream_status=upstream_status,
             )
         except UploadError as exc:
             return Status.FAILED, Outcome(
@@ -644,6 +688,98 @@ class UploadGateway:
                 pump.cancel()
                 with contextlib.suppress(BaseException):
                     await pump
+
+    # Both ways out read the file from the same ``_Stream``, which ends only once the
+    # whole request validated and raises on any failure. Each returns the status worth
+    # recording (the backend's HTTP status, if any), or raises an ``UploadError``.
+
+    async def _to_http(
+        self,
+        dest: Destination,
+        record: Record,
+        filename: str,
+        media_type: str,
+        stream: _Stream,
+        pump: asyncio.Task[None],
+    ) -> int:
+        url = dest.build_url(record.id, filename)
+        headers, body = _upstream(dest, filename, media_type, stream)
+        try:
+            response = await self._http.request(
+                dest.method, url, content=body, headers=headers, timeout=dest.timeout
+            )
+        except UploadError:
+            raise
+        except httpx.HTTPError as exc:
+            raise UploadError("upstream_unreachable", str(exc)) from exc
+        accepted = 200 <= response.status_code < 300
+        if await _stop_reading(pump) and accepted:
+            # The backend answered before the whole body was forwarded. There is no
+            # sensible way to continue, so stop reading and report it.
+            raise UploadError(
+                "upstream_closed_early",
+                "backend accepted before the upload finished",
+                upstream_status=response.status_code,
+            )
+        stream.raise_for_error()
+        if not accepted:
+            raise UploadError(
+                "upstream_rejected",
+                f"backend returned {response.status_code}",
+                upstream_status=response.status_code,
+            )
+        return response.status_code
+
+    async def _to_sink(
+        self,
+        dest: Destination,
+        record: Record,
+        filename: str,
+        media_type: str,
+        stream: _Stream,
+        pump: asyncio.Task[None],
+    ) -> None:
+        sink = dest.sink
+        if sink is None:  # pragma: no cover - the caller checked
+            raise UploadError("misconfigured")
+        incoming = IncomingFile(
+            record_id=record.id,
+            destination=dest.name,
+            filename=filename,
+            media_type=media_type,
+            expected_size=record.constraints.expected_size,
+            expected_sha256=record.constraints.expected_sha256,
+            read=stream.read_for_sink,
+        )
+        loop = asyncio.get_running_loop()
+        try:
+            # The watchdog bounds the client. Once the body stops arriving, ended or
+            # failed, the sink has dest.timeout to finish, as a backend has its read
+            # timeout, so a sink stuck in its own I/O cannot hold a slot forever.
+            async with asyncio.timeout(None) as bound:
+
+                def arm(_: object) -> None:
+                    with contextlib.suppress(RuntimeError):
+                        bound.reschedule(loop.time() + dest.timeout)
+
+                pump.add_done_callback(arm)
+                try:
+                    await sink(incoming)
+                finally:
+                    pump.remove_done_callback(arm)
+        except Exception as exc:
+            # A sink that saw UploadAborted and raised, or raised something of its own
+            # after the upload failed, is reporting the upload's own failure.
+            stream.raise_for_error()
+            logger.warning("sink for %s raised on %s: %r", dest.name, record.id, exc)
+            reason = "sink did not finish in time" if isinstance(exc, TimeoutError) else repr(exc)
+            raise UploadError("sink_failed", reason) from exc
+        stopped = await _stop_reading(pump)
+        stream.raise_for_error()
+        if stopped or not stream.ended:
+            raise UploadError(
+                "upstream_closed_early", "the sink returned before the end of the upload"
+            )
 
     # ----- responses ---------------------------------------------------------------
 
@@ -745,24 +881,8 @@ class _FileTarget(BaseTarget):
             # A part with the right name but no filename is a plain form field, not a
             # file. Treating it as a file is how a text value ends up read as bytes.
             raise UploadError("missing_file", "the file part has no filename")
-        declared = self.multipart_content_type or "application/octet-stream"
-        media_type = declared.split(";", 1)[0].strip().lower()
-        if len(media_type) > _MAX_MEDIA_TYPE_LENGTH or not _MEDIA_TYPE.fullmatch(media_type):
-            # The parser passes the header value through as-is, control characters and
-            # all. It is about to become a header on the backend request.
-            raise UploadError("invalid_media_type", "declared media type is not a valid token")
-        if not self._constraints.allows(media_type):
-            raise UploadError(
-                "unsupported_media_type",
-                media_type,
-                details={
-                    "reason": "mimeTypeNotAccepted",
-                    "mimeType": media_type,
-                    "accept": list(self._constraints.accept),
-                },
-            )
+        self.media_type = _checked_media_type(self.multipart_content_type, self._constraints)
         self.filename = sanitize_filename(self.multipart_filename)
-        self.media_type = media_type
         self._state.started.set()
 
     async def on_data_received_async(self, chunk: bytes) -> None:
@@ -891,21 +1011,75 @@ async def _watch(
             return
 
 
+class _MultipartBody:
+    """A form body: framed, parsed incrementally, the file part going to the target."""
+
+    def __init__(self, headers: Mapping[str, str], field: str, target: _FileTarget) -> None:
+        self._parser = StreamingFormDataParser(headers=headers, strict=True)
+        self._parser.register(field, target)
+        self._framer = Framer(boundary_of(headers), max_preamble=_MAX_PREAMBLE)
+        self._target = target
+        self._fed = 0
+
+    async def feed(self, chunk: bytes) -> bool:
+        """Hand one read to the parser. True when the rest of the body can be ignored."""
+        try:
+            body = self._framer.feed(chunk)
+        except ValueError as exc:
+            raise UploadError("bad_multipart", str(exc)) from None
+        pieces = (
+            (body,)
+            if len(body) <= _FEED_SLICE
+            else [body[at : at + _FEED_SLICE] for at in range(0, len(body), _FEED_SLICE)]
+        )
+        for piece in pieces:
+            await self._parser.adata_received(piece)
+            self._fed += len(piece)
+            if self._fed - self._target.size > _MAX_OVERHEAD:
+                raise UploadError("part_headers_too_large", "too much non-file data")
+        # Once the close delimiter has passed, everything the parser needs has arrived.
+        # The rest is ignorable by definition, so stop reading it rather than refuse a
+        # complete upload.
+        return self._framer.closed and self._framer.epilogue > _MAX_EPILOGUE
+
+    async def end(self) -> None:
+        if self._target.parts == 0:
+            raise UploadError("missing_file", "no file part in the body")
+        if not self._target.done:
+            raise UploadError("truncated", "body ended before the file part was closed")
+
+
+class _RawBody:
+    """A raw body: the bytes are the file. Its name and type came from the headers and
+    were checked before the ticket was spent, so there is nothing to parse."""
+
+    def __init__(self, target: _FileTarget, filename: str, media_type: str) -> None:
+        target.set_multipart_filename(filename)
+        target.set_multipart_content_type(media_type)
+        target.parts = 1
+        self._target = target
+
+    async def feed(self, chunk: bytes) -> bool:
+        await self._target.on_data_received_async(chunk)
+        return False
+
+    async def end(self) -> None:
+        await self._target.on_finish_async()
+
+
 async def _pump(
     request: Request,
-    parser: StreamingFormDataParser,
+    body: _MultipartBody | _RawBody,
     target: _FileTarget,
     queue: asyncio.Queue[Any],
     state: _PumpState,
-    framer: Framer,
     meter: _Meter,
     stall_min_bytes: int,
 ) -> None:
-    """Read the request body and feed it to the parser. Any failure is recorded on
-    ``state`` and signalled into the queue so the upstream body generator stops."""
+    """Read the request body and feed it on. Any failure is recorded on ``state`` and
+    signalled into the queue so whatever reads the stream stops."""
     loop = asyncio.get_running_loop()
     try:
-        fed = 0
         stream = request.stream().__aiter__()
         while True:
             meter.waiting_since = loop.time()
@@ -921,30 +1095,12 @@ async def _pump(
             if meter.window_bytes >= stall_min_bytes:
                 meter.window_bytes = 0
                 meter.waited = 0.0
-            try:
-                body = framer.feed(chunk)
-            except ValueError as exc:
-                raise UploadError("bad_multipart", str(exc)) from None
-            pieces = (
-                (body,)
-                if len(body) <= _FEED_SLICE
-                else [body[at : at + _FEED_SLICE] for at in range(0, len(body), _FEED_SLICE)]
-            )
-            for piece in pieces:
-                await parser.adata_received(piece)
-                fed += len(piece)
-                if fed - target.size > _MAX_OVERHEAD:
-                    raise UploadError("part_headers_too_large", "too much non-file data")
-            if framer.closed and framer.epilogue > _MAX_EPILOGUE:
-                # Everything the parser needs has arrived. The rest is ignorable by
-                # definition, so stop reading it rather than refuse a complete upload.
+            if await body.feed(chunk):
                 break
-        if target.parts == 0:
-            raise UploadError("missing_file", "no file part in the body")
-        if not target.done:
-            raise UploadError("truncated", "body ended before the file part was closed")
-        # The end of the upstream body has not been sent yet, so a mismatch here
-        # leaves the backend with an incomplete request rather than a committed file.
+        await body.end()
+        # The end of the stream has not been signalled yet, so a mismatch here leaves
+        # the backend with an incomplete request, or the sink with UploadAborted, rather
+        # than a committed file.
         target.verify()
         await queue.put(_DONE)
     except UploadError as exc:
@@ -963,19 +1119,71 @@ async def _pump(
         state.error = UploadError("internal", repr(exc))
     finally:
         if state.error is not None:
-            # Wake the generator if it is waiting on an empty queue. If the queue is
-            # full the generator is not waiting; it checks state.error as it drains.
+            # Wake the reader if it is waiting on an empty queue. If the queue is full
+            # the reader is not waiting, and it checks state.error on its next read.
             with contextlib.suppress(asyncio.QueueFull):
                 queue.put_nowait(_Abort(state.error))
             state.started.set()
+
+
+class _Stream:
+    """The file's bytes on their way out of the forwarding queue, for the backend
+    request or the sink alike.
+
+    ``read`` returns None only at the end the pump signals after the whole request
+    validated. On any failure it raises the upload's error instead, on this read and
+    every later one, even if valid chunks are still queued. A consumer therefore
+    cannot mistake a failed upload for a finished one.
+    """
+
+    def __init__(self, queue: asyncio.Queue[Any], state: _PumpState) -> None:
+        self._queue = queue
+        self._state = state
+        self.ended = False
+
+    def raise_for_error(self) -> None:
+        if self._state.error is not None:
+            raise self._state.error
+
+    async def read(self) -> bytes | None:
+        if self.ended:
+            return None
+        self.raise_for_error()
+        item = await self._queue.get()
+        if isinstance(item, _Abort):
+            raise item.exc
+        self.raise_for_error()
+        if item is _DONE:
+            self.ended = True
+            return None
+        data: bytes = item
+        return data
+
+    async def read_for_sink(self) -> bytes | None:
+        try:
+            return await self.read()
+        except UploadError as exc:
+            raise UploadAborted(exc.code, exc.details) from None
+
+
+async def _stop_reading(pump: asyncio.Task[None]) -> bool:
+    """Collect the pump if it has finished, or stop it if it is still reading. True
+    when it had to be stopped, which means the destination quit before the end."""
+    if pump.done():
+        if not pump.cancelled():
+            await pump
+        return False
+    pump.cancel()
+    with contextlib.suppress(BaseException):
+        await pump
+    return True
 
 
 def _upstream(
     dest: Destination,
     filename: str,
     media_type: str,
-    queue: asyncio.Queue[Any],
-    state: _PumpState,
+    stream: _Stream,
 ) -> tuple[dict[str, str], AsyncIterator[bytes]]:
     headers = dict(dest.headers)
     if dest.encoding == "multipart":
@@ -996,15 +1204,8 @@ def _upstream(
     async def body() -> AsyncIterator[bytes]:
         if preamble:
             yield preamble
-        while True:
-            if queue.empty() and state.error is not None:
-                raise state.error
-            item = await queue.get()
-            if item is _DONE:
-                break
-            if isinstance(item, _Abort):
-                raise item.exc
-            yield item
+        while (chunk := await stream.read()) is not None:
+            yield chunk
         if epilogue:
             yield epilogue
 
@@ -1083,21 +1284,35 @@ _NO_STORE = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
 
 # The page carries a live credential in its URL and a form that mutates state. It
 # loads nothing external, so the policy can refuse everything but its own inline
-# style, and it must never be framed by another site.
+# style (and on the form, its own script), and it must never be framed by another site.
+_POLICY = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
+
 _PAGE_HEADERS = {
     **_NO_STORE,
     "Referrer-Policy": "no-referrer",
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+    "Content-Security-Policy": _POLICY,
     "X-Frame-Options": "DENY",
 }
+
+
+def _form_policy(nonce: str) -> str:
+    """The upload form's policy: the same, plus its one script, identified by a nonce
+    minted for this response, and requests back to this origin, which is where that
+    script sends the file."""
+    return (
+        "default-src 'none'; style-src 'unsafe-inline'; "
+        f"script-src 'nonce-{nonce}'; connect-src 'self'; form-action 'self'"
+    )
 
 
 def _json(body: dict[str, Any], status: int, extra: dict[str, str] | None = None) -> Response:
     return JSONResponse(body, status_code=status, headers={**_NO_STORE, **(extra or {})})
 
 
-def _html(body: str, status: int) -> Response:
-    return HTMLResponse(body, status_code=status, headers=_PAGE_HEADERS)
+def _html(body: str, status: int, csp: str = _POLICY) -> Response:
+    return HTMLResponse(
+        body, status_code=status, headers={**_PAGE_HEADERS, "Content-Security-Policy": csp}
+    )
 
 
 def _wants_html(request: Request) -> bool:
@@ -1107,6 +1322,41 @@ def _wants_html(request: Request) -> bool:
 
 def _iso(when: datetime) -> str:
     return when.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _checked_media_type(declared: str | None, constraints: Constraints) -> str:
+    """A declared media type, reduced to ``type/subtype`` and checked. It is about to
+    become a header on the backend request and a field on the record, and both the
+    multipart parser and a raw request pass the value through as-is, control characters
+    and all, so it has to be a real token. Then it has to be on the accept list."""
+    media_type = (declared or "application/octet-stream").split(";", 1)[0].strip().lower()
+    if len(media_type) > _MAX_MEDIA_TYPE_LENGTH or not _MEDIA_TYPE.fullmatch(media_type):
+        raise UploadError("invalid_media_type", "declared media type is not a valid token")
+    if not constraints.allows(media_type):
+        raise UploadError(
+            "unsupported_media_type",
+            media_type,
+            details={
+                "reason": "mimeTypeNotAccepted",
+                "mimeType": media_type,
+                "accept": list(constraints.accept),
+            },
+        )
+    return media_type
+
+
+def _raw_file(request: Request, constraints: Constraints) -> tuple[str, str]:
+    """The filename and media type of a raw upload, from its headers. The filename is
+    the Content-Disposition header's, else the ``filename`` query parameter, else
+    "upload". It is sanitized like a form part's before anything sees it."""
+    media_type, _ = parse_content_type(request.headers.get("content-type"))
+    checked = _checked_media_type(media_type or None, constraints)
+    name = filename_from_disposition(request.headers.get("content-disposition"))
+    return name or request.query_params.get("filename") or "upload", checked
+
+
+def _single_type(accept: tuple[str, ...]) -> str | None:
+    return accept[0].lower() if len(accept) == 1 and "*" not in accept[0] else None
 
 
 __all__ = ["ERROR_STATUS", "ClaimRefused", "Issued", "StoreFull", "UploadError", "UploadGateway"]
