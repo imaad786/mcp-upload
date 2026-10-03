@@ -11,9 +11,11 @@ feature the version lacks gets ``{"unsupported": name}`` with status 400.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import inspect
 import os
 import tempfile
+from collections import Counter
 from datetime import timedelta
 from typing import Any
 
@@ -43,11 +45,40 @@ def build(args: argparse.Namespace) -> Starlette:
             timeout=args.dest_timeout,
         ),
     )
+    redis_options: dict[str, bool] = {}
     if args.store == "sqlite":
         path = args.db or os.path.join(tempfile.mkdtemp(), "tickets.db")
         store: Any = SqliteStore(path)
+    elif args.store == "redis":
+        from redis.asyncio import BlockingConnectionPool, Redis
+
+        from mcp_upload.redis_store import RedisStore
+
+        if args.redis_pool == "blocking":
+            # Waits for a free connection. The default pool of redis-py 6 and later
+            # raises MaxConnectionsError past 100 connections instead.
+            client = Redis(
+                connection_pool=BlockingConnectionPool.from_url(
+                    args.redis_url, max_connections=args.redis_max_connections, timeout=30
+                )
+            )
+        else:
+            client = Redis.from_url(args.redis_url)
+
+        store_params = inspect.signature(RedisStore.__init__).parameters
+        for name in ("server_clock", "legacy_layout"):
+            if getattr(args, name) and name in store_params:
+                redis_options[name] = True
+        store = RedisStore(client, prefix=args.prefix, **redis_options)
     else:
         store = MemoryStore(max_records=1_000_000)
+    hooks: Counter[str] = Counter()
+
+    async def on_complete(record: Any) -> None:
+        if args.hook_delay:
+            await asyncio.sleep(args.hook_delay)
+        hooks[record.status.value] += 1
+
     options: dict[str, Any] = {
         "base_url": f"http://127.0.0.1:{args.port}",
         "registry": registry,
@@ -57,6 +88,8 @@ def build(args: argparse.Namespace) -> Starlette:
         options["max_in_flight"] = args.max_in_flight
     if args.upload_timeout is not None:
         options["upload_timeout"] = timedelta(seconds=args.upload_timeout)
+    if args.hook:
+        options["on_complete"] = on_complete
     accepted = inspect.signature(UploadGateway.__init__).parameters
     gateway = UploadGateway(**{k: v for k, v in options.items() if k in accepted})
     issue_params = inspect.signature(gateway.issue).parameters
@@ -68,6 +101,11 @@ def build(args: argparse.Namespace) -> Starlette:
         "expected_digest": "expected_digest" in issue_params,
         "claim": hasattr(gateway, "claim"),
         "upload_timeout": "upload_timeout" in accepted,
+        "on_complete": "on_complete" in accepted,
+        "hook_installed": args.hook and "on_complete" in accepted,
+        "store": args.store,
+        "redis_options": redis_options,
+        "redis_pool": args.redis_pool if args.store == "redis" else None,
     }
 
     def unsupported(name: str) -> JSONResponse:
@@ -124,6 +162,11 @@ def build(args: argparse.Namespace) -> Starlette:
     async def version(request: Request) -> JSONResponse:
         return JSONResponse({"version": mcp_upload.__version__})
 
+    async def hook_counts(request: Request) -> JSONResponse:
+        if not caps["hook_installed"]:
+            return unsupported("on_complete")
+        return JSONResponse({"counts": dict(hooks), "total": sum(hooks.values())})
+
     return Starlette(
         routes=[
             *gateway.routes(),
@@ -132,6 +175,7 @@ def build(args: argparse.Namespace) -> Starlette:
             Route("/_claim/{id}", claim, methods=["POST"]),
             Route("/_caps", capabilities),
             Route("/_version", version),
+            Route("/_hooks", hook_counts),
         ]
     )
 
@@ -140,12 +184,29 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--backend", required=True)
-    parser.add_argument("--store", choices=["memory", "sqlite"], default="memory")
+    parser.add_argument("--store", choices=["memory", "sqlite", "redis"], default="memory")
     parser.add_argument("--max-size", type=int, default=None)
     parser.add_argument("--max-in-flight", type=int, default=None)
     parser.add_argument("--dest-timeout", type=float, default=60.0)
     parser.add_argument("--db", default=None, help="SqliteStore file, kept across restarts")
     parser.add_argument("--upload-timeout", type=float, default=None)
+    parser.add_argument("--redis-url", default="redis://localhost:56379/0")
+    parser.add_argument("--prefix", default="mcp_upload_stress", help="RedisStore key prefix")
+    parser.add_argument(
+        "--redis-pool",
+        choices=["blocking", "default"],
+        default="blocking",
+        help="a BlockingConnectionPool, or Redis.from_url as the README shows",
+    )
+    parser.add_argument("--redis-max-connections", type=int, default=64)
+    parser.add_argument(
+        "--server-clock", action="store_true", help="RedisStore server_clock, if supported"
+    )
+    parser.add_argument(
+        "--legacy-layout", action="store_true", help="RedisStore legacy_layout, if supported"
+    )
+    parser.add_argument("--hook", action="store_true", help="count on_complete calls")
+    parser.add_argument("--hook-delay", type=float, default=0.0, help="seconds the hook sleeps")
     args = parser.parse_args()
     uvicorn.run(build(args), host="127.0.0.1", port=args.port, log_level="warning", backlog=4096)
 

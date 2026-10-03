@@ -32,6 +32,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import uuid
 from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -106,11 +107,11 @@ class Stack:
         return f"http://127.0.0.1:{self.backend_port}"
 
 
-def start(src: str, **gateway_args: Any) -> Stack:
+def start_gateway(
+    src: str, bport: int, **gateway_args: Any
+) -> tuple[int, subprocess.Popen[bytes], RssWatch]:
     env = {**os.environ, "PYTHONPATH": src}
-    bport, gport = free_port(), free_port()
-    backend = subprocess.Popen([sys.executable, str(HERE / "backend.py"), str(bport)], env=env)
-    wait_port(bport)
+    gport = free_port()
     cmd = [
         sys.executable,
         str(HERE / "gateway.py"),
@@ -120,14 +121,49 @@ def start(src: str, **gateway_args: Any) -> Stack:
         f"http://127.0.0.1:{bport}",
     ]
     for key, value in gateway_args.items():
-        if value is not None:
-            cmd += [f"--{key.replace('_', '-')}", str(value)]
+        flag = f"--{key.replace('_', '-')}"
+        if value is True:
+            cmd.append(flag)
+        elif value is not None and value is not False:
+            cmd += [flag, str(value)]
     gateway = subprocess.Popen(cmd, env=env)
     wait_port(gport)
     watch = RssWatch(gateway)
     watch.base_mb = watch.sample()
     watch.start()
+    return gport, gateway, watch
+
+
+def start(src: str, **gateway_args: Any) -> Stack:
+    env = {**os.environ, "PYTHONPATH": src}
+    bport = free_port()
+    backend = subprocess.Popen([sys.executable, str(HERE / "backend.py"), str(bport)], env=env)
+    wait_port(bport)
+    gport, gateway, watch = start_gateway(src, bport, **gateway_args)
     return Stack(gport, bport, gateway, backend, watch)
+
+
+def replica(src: str, of: Stack, **gateway_args: Any) -> Stack:
+    """A second gateway process in front of the same backend as ``of``."""
+    gport, gateway, watch = start_gateway(src, of.backend_port, **gateway_args)
+    return Stack(gport, of.backend_port, gateway, of.backend, watch)
+
+
+def cpu_seconds(proc: subprocess.Popen[bytes]) -> float:
+    """User plus system CPU time of a process so far, from ``ps -o time``."""
+    out = subprocess.run(
+        ["ps", "-o", "time=", "-p", str(proc.pid)], capture_output=True, text=True
+    ).stdout.strip()
+    if not out:
+        return 0.0
+    days = 0
+    if "-" in out:
+        d, out = out.split("-", 1)
+        days = int(d)
+    total = 0.0
+    for part in out.split(":"):
+        total = total * 60 + float(part)
+    return days * 86400 + total
 
 
 def stop(stack: Stack) -> None:
@@ -1117,19 +1153,410 @@ async def sqlite_migration(src: str) -> dict[str, Any]:
     )
 
 
+# ----- 0.5.0: small client chunks, store-backed uploads, replicas, the completion hook -----
+#
+# The replica scenarios run two gateway processes in front of one backend and one shared
+# store. Redis scenarios use a fresh key prefix per run and delete only their own keys.
+
+REDIS_URL = "redis://localhost:56379/0"  # set by --redis-url
+
+
+# macOS caps the accept queue at 128 (kern.ipc.somaxconn), so a burst of connections
+# can be reset before the gateway accepts them. The new scenarios retry a connection the
+# kernel refused, which is safe because nothing reached the gateway, and report how
+# often that happened as ``connect_retries``. Latency includes the retries.
+CONNECT_RETRIES: Counter[str] = Counter()
+
+
+async def http_rc(port: int, method: str, path: str, **kw: Any) -> Reply:
+    t0 = time.perf_counter()
+    for attempt in range(40):
+        reply = await http(port, method, path, **kw)
+        if reply.status or not (reply.error or "").startswith("connect:"):
+            break
+        CONNECT_RETRIES["total"] += 1
+        await asyncio.sleep(min(0.05 * (attempt + 1), 0.5))
+    reply.elapsed = time.perf_counter() - t0
+    return reply
+
+
+async def issue_rc(stack: Stack, **kw: Any) -> dict[str, Any]:
+    reply = await http_rc(
+        stack.gateway_port,
+        "POST",
+        "/_issue",
+        headers={"Content-Type": "application/json"},
+        body=json.dumps(kw).encode(),
+    )
+    if "path" not in reply.body:
+        return {"issue_failed": reply.status or reply.error, **reply.body}
+    return reply.body
+
+
+async def send_rc(stack: Stack, ticket: dict[str, Any], body: Body, **kw: Any) -> Reply:
+    reply = await http_rc(stack.gateway_port, "POST", ticket["path"], headers=CT, body=body, **kw)
+    reply.body.setdefault("id", ticket.get("id"))
+    return reply
+
+
+async def upload_rc(stack: Stack, body: Body, *, retries: int = 0, **kw: Any) -> Reply:
+    """``upload`` with connection retries. Fails loudly if the ticket cannot be issued."""
+    ticket = await issue_rc(stack)
+    if "path" not in ticket:
+        return Reply(0, ticket, 0.0, 0, "issue failed")
+    for attempt in range(retries + 1):
+        reply = await send_rc(stack, ticket, body, **kw)
+        if reply.status != 503 or attempt == retries:
+            break
+        await asyncio.sleep(0.25 + random.random() * 0.5)
+    return reply
+
+
+async def status_rc(stack: Stack, record_id: str) -> dict[str, Any]:
+    return (await http_rc(stack.gateway_port, "GET", f"/_status/{record_id}")).body
+
+
+async def claim_rc(stack: Stack, record_id: str) -> dict[str, Any]:
+    return (await http_rc(stack.gateway_port, "POST", f"/_claim/{record_id}")).body
+
+
+def redis_prefix(tag: str) -> str:
+    return f"mcp_upload_stress:{tag}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+
+def redis_cleanup(prefix: str) -> int:
+    """Delete every key under ``prefix`` and return how many there were."""
+    import redis
+
+    client = redis.Redis.from_url(REDIS_URL)
+    try:
+        keys = list(client.scan_iter(match=f"{prefix}:*", count=1000))
+        for i in range(0, len(keys), 500):
+            client.delete(*keys[i : i + 500])
+        return len(keys)
+    finally:
+        client.close()
+
+
+def redis_args(prefix: str) -> dict[str, Any]:
+    return {"store": "redis", "redis_url": REDIS_URL, "prefix": prefix}
+
+
+def wrong_bytes(replies: list[Reply], digests: list[str], commits: dict[str, Any]) -> int:
+    """Completed uploads whose backend commit is missing or has other bytes."""
+    return sum(
+        1
+        for r, d in zip(replies, digests, strict=True)
+        if r.body.get("status") == "completed" and commits.get(r.body["id"], {}).get("sha256") != d
+    )
+
+
+@scenario
+async def throughput_small_chunks(src: str) -> dict[str, Any]:
+    """The client sends 16 KiB chunked frames, as many clients and proxies do: one 512 MiB
+    upload, then 100 concurrent 8 MiB uploads (cap 256). Throughput, the gateway's and
+    the backend's CPU seconds, and integrity."""
+    stack = start(src, max_in_flight=256)
+    try:
+        body, digest = file_body(512 * MB, chunk=16 * 1024)
+        g0, b0 = cpu_seconds(stack.gateway), cpu_seconds(stack.backend)
+        reply = await upload_rc(stack, body)
+        g1, b1 = cpu_seconds(stack.gateway), cpu_seconds(stack.backend)
+        commits = (await backend(stack))["commits"]
+        single = {
+            "outcome": reply.body.get("status") or reply.body.get("error") or reply.error,
+            "mib_per_s": round(512 / reply.elapsed),
+            "gateway_cpu_s": round(g1 - g0, 2),
+            "backend_cpu_s": round(b1 - b0, 2),
+            "integrity_ok": commits.get(reply.body.get("id"), {}).get("sha256") == digest,
+        }
+        bodies = [file_body(8 * MB, chunk=16 * 1024, seed=i) for i in range(100)]
+        g0, b0 = cpu_seconds(stack.gateway), cpu_seconds(stack.backend)
+        t = time.perf_counter()
+        replies = await asyncio.gather(*(upload_rc(stack, b, retries=20) for b, _ in bodies))
+        wall = time.perf_counter() - t
+        g1, b1 = cpu_seconds(stack.gateway), cpu_seconds(stack.backend)
+        commits = (await backend(stack))["commits"]
+        concurrent = {
+            "outcomes": outcomes(replies),
+            "aggregate_mib_per_s": round(100 * 8 / wall),
+            "p99_latency_s": round(pct([r.elapsed for r in replies], 99), 2),
+            "gateway_cpu_s": round(g1 - g0, 2),
+            "backend_cpu_s": round(b1 - b0, 2),
+            "integrity_violations": wrong_bytes(replies, [d for _, d in bodies], commits),
+        }
+    finally:
+        stop(stack)
+    return finish(stack, {"single_512mib": single, "concurrent_100x8mib": concurrent})
+
+
+@scenario
+async def store_backed_uploads(src: str) -> dict[str, Any]:
+    """400 tickets issued at once, then 400 concurrent 64 KiB uploads, through the SQLite
+    store and then the Redis store. Issue rate, upload rate, latency, integrity.
+
+    Redis runs with a BlockingConnectionPool of 64, and once more with the client the
+    README shows, ``Redis.from_url(url)``, whose pool (redis-py 6 and later) raises past
+    100 connections. Failed issues are counted and those tickets skipped."""
+    result: dict[str, Any] = {}
+    for store in ("sqlite", "redis", "redis_default_client"):
+        prefix = redis_prefix("store") if store.startswith("redis") else None
+        args = redis_args(prefix) if prefix else {"store": "sqlite"}
+        if store == "redis_default_client":
+            args["redis_pool"] = "default"
+        stack = start(src, max_in_flight=512, **args)
+        try:
+            t = time.perf_counter()
+            issued = await asyncio.gather(*(issue_rc(stack) for _ in range(400)))
+            issue_wall = time.perf_counter() - t
+            tickets = [tk for tk in issued if "path" in tk]
+            bodies = [file_body(64 * 1024, seed=i) for i in range(len(tickets))]
+            g0 = cpu_seconds(stack.gateway)
+            t = time.perf_counter()
+            replies = await asyncio.gather(
+                *(send_rc(stack, tk, b) for tk, (b, _) in zip(tickets, bodies, strict=True))
+            )
+            wall = time.perf_counter() - t
+            g1 = cpu_seconds(stack.gateway)
+            commits = (await backend(stack))["commits"]
+            latencies = [r.elapsed for r in replies]
+            result[store] = {
+                "issue_per_s": round(400 / issue_wall),
+                "issue_failures": dict(
+                    Counter(str(tk["issue_failed"]) for tk in issued if "path" not in tk)
+                ),
+                "outcomes": outcomes(replies),
+                "uploads_per_s": round(len(tickets) / wall) if tickets else 0,
+                "p50_latency_ms": round(pct(latencies, 50) * 1000, 1),
+                "p99_latency_ms": round(pct(latencies, 99) * 1000, 1),
+                "gateway_cpu_s": round(g1 - g0, 2),
+                "integrity_violations": wrong_bytes(replies, [d for _, d in bodies], commits),
+                "backend_commits": len(commits),
+            }
+        finally:
+            stop(stack)
+            if prefix:
+                result.setdefault(store, {})["redis_keys_removed"] = redis_cleanup(prefix)
+        result[store] = finish(stack, result[store])
+    return result
+
+
+async def two_replicas(src: str, store_args: dict[str, Any]) -> dict[str, Any]:
+    """Replica A issues 200 tickets. 100 are uploaded to replica B alone, and 100 are
+    posted to A and B at the same moment (one winner each, the loser refused). Every
+    record's status is read on both replicas. Then every completed record gets 20
+    concurrent claims, 10 on each replica, and exactly one may win."""
+    a = start(src, max_in_flight=512, **store_args)
+    b = replica(src, a, max_in_flight=512, **store_args)
+    try:
+        caps = await capabilities(a)
+        if missing := lacking(caps, "claim"):
+            stop(b)
+            return unsupported(a, missing)
+        size = 256 * 1024
+        tickets = list(await asyncio.gather(*(issue_rc(a) for _ in range(200))))
+        if failed := [t for t in tickets if "path" not in t]:
+            raise RuntimeError(f"{len(failed)} issues failed on A, first: {failed[0]}")
+        bodies = [file_body(size, chunk=64 * 1024, seed=3000 + i) for i in range(200)]
+
+        order = random.Random(17)
+
+        async def race(t: dict[str, Any], body: Body) -> tuple[Reply, Reply]:
+            # Which replica's request is started first alternates at random, so neither
+            # side wins just by being scheduled first.
+            if order.random() < 0.5:
+                ra, rb = await asyncio.gather(send_rc(a, t, body), send_rc(b, t, body))
+            else:
+                rb, ra = await asyncio.gather(send_rc(b, t, body), send_rc(a, t, body))
+            return ra, rb
+
+        solo_task = asyncio.gather(*(send_rc(b, tickets[i], bodies[i][0]) for i in range(100)))
+        race_task = asyncio.gather(*(race(tickets[i], bodies[i][0]) for i in range(100, 200)))
+        solo, races = await asyncio.gather(solo_task, race_task)
+        await asyncio.sleep(0.5)
+        commits = (await backend(a))["commits"]
+
+        expected: dict[str, str] = {}  # record id -> "completed" or what a loser left
+        solo_wrong = 0
+        for i, r in enumerate(solo):
+            if r.body.get("status") == "completed":
+                expected[tickets[i]["id"]] = "completed"
+                if commits.get(tickets[i]["id"], {}).get("sha256") != bodies[i][1]:
+                    solo_wrong += 1
+        winners: Counter[int] = Counter()
+        winner_side: Counter[str] = Counter()
+        loser: Counter[str] = Counter()
+        race_wrong = 0
+        for j, (ra, rb) in enumerate(races):
+            i = 100 + j
+            wins = [
+                side for side, r in (("A", ra), ("B", rb)) if r.body.get("status") == "completed"
+            ]
+            winners[len(wins)] += 1
+            winner_side.update(wins)
+            for r in (ra, rb):
+                if r.body.get("status") != "completed":
+                    loser[f"{r.status} {r.body.get('error') or r.error}"] += 1
+            if wins:
+                expected[tickets[i]["id"]] = "completed"
+                if commits.get(tickets[i]["id"], {}).get("sha256") != bodies[i][1]:
+                    race_wrong += 1
+
+        async def check_status(stack: Stack) -> dict[str, Any]:
+            got = await asyncio.gather(*(status_rc(stack, t["id"]) for t in tickets))
+            wrong = 0
+            for t, s, (_, d) in zip(tickets, got, bodies, strict=True):
+                if expected.get(t["id"]) == "completed":
+                    file = s.get("file", {})
+                    ok = (
+                        s.get("status") == "completed"
+                        and file.get("size") == size
+                        and digest_matches(str(file.get("digest", {}).get("value", "")), d)
+                    )
+                    wrong += not ok
+            return {"statuses": dict(Counter(s.get("status") for s in got)), "wrong": wrong}
+
+        status_a = await check_status(a)
+        status_b = await check_status(b)
+
+        claim_winners: Counter[int] = Counter()
+        claim_side: Counter[str] = Counter()
+        refusals: Counter[str] = Counter()
+        for rid, state in expected.items():
+            if state != "completed":
+                continue
+            sides = ["A"] * 10 + ["B"] * 10
+            order.shuffle(sides)
+            claims = await asyncio.gather(
+                *(claim_rc(a if side == "A" else b, rid) for side in sides)
+            )
+            claim_winners[sum(bool(c.get("claimed")) for c in claims)] += 1
+            claim_side.update(
+                side for side, c in zip(sides, claims, strict=True) if c.get("claimed")
+            )
+            refusals.update(c.get("refused", "?") for c in claims if not c.get("claimed"))
+        after = await asyncio.gather(*(status_rc(a, rid) for rid in expected))
+        result = {
+            "supported": True,
+            "solo_on_b": outcomes(list(solo)),
+            "solo_integrity_violations": solo_wrong,
+            "race_tickets_by_winner_count": {str(k): v for k, v in sorted(winners.items())},
+            "race_winner_replica": dict(winner_side),
+            "race_loser_replies": dict(loser),
+            "race_integrity_violations": race_wrong,
+            "backend_commits": len(commits),
+            "status_on_a": status_a,
+            "status_on_b": status_b,
+            "claim_records_by_winner_count": {str(k): v for k, v in sorted(claim_winners.items())},
+            "claim_winner_replica": dict(claim_side),
+            "claim_refusals": dict(refusals),
+            "status_after_claims_on_a": dict(Counter(s.get("status") for s in after)),
+        }
+    finally:
+        stop(b)
+        stop(a)
+    finish(b, {})
+    result["replica_b_peak_rss_mb"] = round(b.watch.peak_mb)
+    return finish(a, result)
+
+
+@scenario
+async def redis_two_replicas(src: str) -> dict[str, Any]:
+    """Two gateway processes sharing one Redis under one prefix. See ``two_replicas``."""
+    prefix = redis_prefix("replicas")
+    try:
+        result = await two_replicas(src, redis_args(prefix))
+    finally:
+        removed = redis_cleanup(prefix)
+    result["redis_keys_removed"] = removed
+    return result
+
+
+@scenario
+async def sqlite_two_processes(src: str) -> dict[str, Any]:
+    """Two gateway processes sharing one SQLite file. See ``two_replicas``."""
+    db = os.path.join(tempfile.mkdtemp(), "tickets.db")
+    return await two_replicas(src, {"store": "sqlite", "db": db})
+
+
+@scenario
+async def on_complete_hook(src: str) -> dict[str, Any]:
+    """200 concurrent uploads, 150 good (256 KiB) and 50 oversize (2 MiB against a 1 MiB
+    limit), with an on_complete hook that sleeps 50 ms and counts by final status, and
+    the same load on a twin without the hook. Three rounds each, alternating. The hook
+    must see 150 completed and 50 failed, and must not add to upload latency."""
+    probe = start(src)
+    caps = await capabilities(probe)
+    if missing := lacking(caps, "on_complete"):
+        return unsupported(probe, missing)
+    stop(probe)
+
+    async def one_round(hook: bool, seed: int) -> dict[str, Any]:
+        stack = start(src, max_size=MB, max_in_flight=256, hook=hook, hook_delay=0.05)
+        try:
+            kinds = ["good"] * 150 + ["oversize"] * 50
+            random.Random(seed).shuffle(kinds)
+            bodies = [
+                file_body(256 * 1024 if k == "good" else 2 * MB, seed=seed * 1000 + i)
+                for i, k in enumerate(kinds)
+            ]
+            replies = await asyncio.gather(*(upload_rc(stack, b) for b, _ in bodies))
+            await asyncio.sleep(1)
+            hooks = await get_json(stack.gateway_port, "/_hooks") if hook else None
+            commits = (await backend(stack))["commits"]
+            good = [r for k, r in zip(kinds, replies, strict=True) if k == "good"]
+            bad = [r for k, r in zip(kinds, replies, strict=True) if k == "oversize"]
+            good_digests = [d for k, (_, d) in zip(kinds, bodies, strict=True) if k == "good"]
+            return {
+                "good_outcomes": outcomes(good),
+                "oversize_outcomes": outcomes(bad),
+                "good_p50_ms": round(pct([r.elapsed for r in good], 50) * 1000, 1),
+                "good_p99_ms": round(pct([r.elapsed for r in good], 99) * 1000, 1),
+                "integrity_violations": wrong_bytes(good, good_digests, commits),
+                "hooks": hooks,
+            }
+        finally:
+            stop(stack)
+
+    with_hook: list[dict[str, Any]] = []
+    without: list[dict[str, Any]] = []
+    for n in range(3):
+        if n % 2 == 0:
+            with_hook.append(await one_round(True, n))
+            without.append(await one_round(False, n))
+        else:
+            without.append(await one_round(False, n))
+            with_hook.append(await one_round(True, n))
+    counts = [(r["hooks"] or {}).get("counts", {}) for r in with_hook]
+    return {
+        "supported": True,
+        "hook_counts_per_round": counts,
+        "hook_counts_exact": all(c == {"completed": 150, "failed": 50} for c in counts),
+        "median_good_p50_ms_with_hook": statistics.median(r["good_p50_ms"] for r in with_hook),
+        "median_good_p50_ms_without": statistics.median(r["good_p50_ms"] for r in without),
+        "median_good_p99_ms_with_hook": statistics.median(r["good_p99_ms"] for r in with_hook),
+        "median_good_p99_ms_without": statistics.median(r["good_p99_ms"] for r in without),
+        "rounds_with_hook": with_hook,
+        "rounds_without": without,
+    }
+
+
 # ----- main -----------------------------------------------------------------------------
 
 
 async def main() -> None:
+    global OLD_SRC, REDIS_URL
     parser = argparse.ArgumentParser()
     parser.add_argument("--src", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--only", default="")
     parser.add_argument("--old-src", default=None, help="older tree, for sqlite_migration")
+    parser.add_argument("--label", default=None, help="name this run instead of __version__")
+    parser.add_argument("--redis-url", default=REDIS_URL, help="a real Redis, for redis_*")
     args = parser.parse_args()
     src = str(Path(args.src).resolve())
-    global OLD_SRC
     OLD_SRC = str(Path(args.old_src).resolve()) if args.old_src else None
+    REDIS_URL = args.redis_url
     version = subprocess.run(
         [
             sys.executable,
@@ -1141,6 +1568,8 @@ async def main() -> None:
         capture_output=True,
         text=True,
     ).stdout.strip()
+    if args.label:
+        version = f"{args.label} ({version})"
     names = [n for n in args.only.split(",") if n] or list(SCENARIOS)
     results: dict[str, Any] = {"version": version, "src": src, "old_src": OLD_SRC, "scenarios": {}}
     for name in names:
@@ -1150,6 +1579,9 @@ async def main() -> None:
             result = await SCENARIOS[name](src)
         except Exception as exc:
             result = {"harness_error": repr(exc)}
+        if CONNECT_RETRIES["total"]:
+            result["connect_retries"] = CONNECT_RETRIES["total"]
+            CONNECT_RETRIES.clear()
         result["scenario_wall_s"] = round(time.perf_counter() - t, 1)
         results["scenarios"][name] = result
         print(f"    {json.dumps(result)}", flush=True)

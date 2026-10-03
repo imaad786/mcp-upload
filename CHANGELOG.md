@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.5.0 (2026-10-03)
+
+Speed and scale in the stores, and hooks for what happens after an upload. Measured
+against 0.4.0 with the end-to-end harness, which gained scenarios for small client
+frames, store-backed upload rates, two gateway processes sharing one Redis or one
+SQLite file, and the completion hook. Every invariant held on both versions.
+
+**Upgrading a fleet:** `RedisStore` has a new key layout. It reads records written by
+0.4.0, but 0.4.0 cannot read records written by 0.5.0. During a rolling upgrade, run
+the new replicas with `legacy_layout=True` until no 0.4.0 replica is left. Live: with
+the flag, uploads, status and claims worked 20 of 20 in both directions between a
+0.4.0 and a 0.5.0 replica; without it, tickets issued on 0.5.0 are unknown to 0.4.0.
+
+- **SQLite store.** One connection per thread on a small pool of its own, pragmas set
+  once, writes serialized within a process, and the record cap kept by a trigger
+  instead of a `COUNT(*)` on every insert. Issuing runs at 11,648 tickets/s against
+  1,627, and 64 concurrent redemptions at 24,799/s against 6,191. Through the gateway,
+  400 concurrent uploads backed by SQLite completed at 744/s against 500, with p99
+  latency 534 ms against 794 and a third of the gateway CPU. New `aclose()`.
+- **Redis store.** Looking up, redeeming and finishing an upload are one round trip
+  each, three per upload against six. Every script touches one key, so the layout
+  suits Redis Cluster (not tested on a cluster). `server_clock=True` checks expiry
+  against Redis's clock for replicas whose clocks drift. Two gateway processes on one
+  Redis: 200 tickets issued on one and uploaded to the other all completed, 100
+  simultaneous posts of one ticket to both had one winner each, and so did claims. A
+  status lookup on a replica that never saw the record now takes two round trips.
+- **`on_complete`** is awaited with the final record of every redeemed upload after
+  the response has gone out. Live: 150 completed and 50 failed uploads produced
+  exactly 150 and 50 calls, and a hook taking 50 ms did not change upload latency.
+- **OpenTelemetry** traces and metrics when the API is installed and an SDK is
+  configured. No-ops otherwise. New `otel` extra.
+- **README:** the Redis example now uses a blocking connection pool. With redis-py's
+  default pool, 300 of 400 simultaneous uploads failed with 500 on every version.
+
+Throughput is unchanged: one upload at 875 MiB/s against 887, and 200 concurrent at
+738 against 737, medians of three alternating runs. Joining small reads before
+forwarding was tried during development and dropped: no gain with 16 KiB client
+frames, and 30 to 45 percent more memory.
+
 ## 0.4.0 (2026-10-03)
 
 Conformance with SEP-2631's shapes, and the pieces a multi-user server needs. Measured

@@ -263,6 +263,26 @@ minted across both rounds. This needs a client that supports URL-mode elicitatio
 The official SDK's `Client` does, most chat hosts do not yet, and the plain
 `request_upload` tool above works regardless.
 
+### After an upload
+
+`on_complete` is awaited with the final record of every redeemed upload, completed or
+failed, after the response has gone to the uploader. A server can start work on a file
+without polling:
+
+```python
+async def ingest(record: Record) -> None:
+    if record.status is Status.COMPLETED:
+        await queue.put(record.id)
+
+
+gateway = UploadGateway(..., on_complete=ingest)
+```
+
+With the OpenTelemetry API installed (the official SDK depends on it; otherwise the
+`otel` extra) and an SDK configured, the gateway emits a span per upload and metrics
+for tickets issued, uploads by outcome, bytes and duration, under the scope
+`mcp_upload`. Without an SDK these are no-ops.
+
 ### Advertising it as an extension
 
 A client can read a tool description in prose, but nothing machine-readable otherwise
@@ -344,7 +364,11 @@ writers and exactly one sees a row change. `RedisStore` is for a server behind a
 balancer, where the upload almost never arrives at the replica that issued the ticket:
 redemption is a Lua script, because no single Redis command does compare-and-swap on a
 hash field. All three were checked with fifty concurrent redemptions of one ticket and
-one winner. The `Store` protocol is six methods. Bring your own for anything else.
+one winner. The `Store` protocol is seven methods. Bring your own for anything else.
+
+`SqliteStore` keeps one connection per thread on a small pool of its own (`threads=`,
+2 by default) and serializes writes within a process, so concurrent calls queue
+instead of spinning in SQLite's busy handler. Call `await store.aclose()` on shutdown.
 
 `RedisStore` needs the extra and an explicit import, so `import mcp_upload` never
 requires `redis`:
@@ -354,11 +378,15 @@ pip install "mcp-upload[mcp,redis]"
 ```
 
 ```python
-from redis.asyncio import Redis
+from redis.asyncio import BlockingConnectionPool, Redis
 from mcp_upload.redis_store import RedisStore
 
-store = RedisStore(Redis.from_url("redis://localhost:6379/0"))
+pool = BlockingConnectionPool.from_url("redis://localhost:6379/0", max_connections=64)
+store = RedisStore(Redis(connection_pool=pool))
 ```
+
+Use a blocking pool. With redis-py's default pool, a burst past its connection limit
+raises instead of waiting: in a test of 400 simultaneous uploads, 300 failed with 500.
 
 Two things it does deliberately. The Redis key TTL is the retention window and never
 the redemption deadline, because expiring the key at the redemption deadline is what
@@ -368,6 +396,13 @@ the record as a whole, so a decode and re-encode in Lua cannot quietly rewrite a
 `accept` list into an empty object. Its tests run against fakeredis by default and
 against a real Redis in CI, because a store whose one job is atomicity should not be
 certified by a simulator alone.
+
+Each step of an upload is one round trip: looking the ticket up, redeeming it and
+recording the outcome. Every script touches exactly one key, so the layout works on
+Redis Cluster. Two options matter for fleets. `server_clock=True` checks expiry
+against Redis's own clock, for replicas whose clocks drift. `legacy_layout=True` keeps
+writing the 0.4.0 key layout during a rolling upgrade, until no 0.4.0 replica is left;
+records in the old layout are read either way.
 
 ## What the endpoint refuses, and when
 
