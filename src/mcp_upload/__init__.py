@@ -22,7 +22,7 @@ from .store import MemoryStore, SqliteStore, Store, StoreFull
 from .tickets import ClaimError, Constraints, Outcome, Record, RedeemError, Status
 from .types import AwaitingUpload, FileDigest, FileTransferDescriptor, FileValue, UploadStatus
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "ERROR_STATUS",
