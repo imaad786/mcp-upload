@@ -1,5 +1,60 @@
 # Changelog
 
+## Unreleased
+
+Integration features for 0.6.0: uploads into the server's own code, raw-body uploads,
+and a browser page with progress. Nothing changes for an existing server unless it
+opts in. Checked with three new end-to-end scenarios in `stress/run.py`, run at small
+scale, and with headless Chrome against the page.
+
+**Added**
+
+- **Function destinations.** `Destination(name=..., sink=fn)` registers an async
+  function instead of a `url`; exactly one of the two is required. The function gets an
+  `IncomingFile` (record id, sanitized filename, checked media type, declared size and
+  digest) and iterates it for the bytes. Iteration ends normally only after the whole
+  request validated, including the declared size and digest. On any failure the next
+  read raises `UploadAborted` with the error code, so a sink that commits after its
+  loop cannot commit a bad upload. A sink that raises fails the upload as `sink_failed`
+  (502, never echoed); one that returns before the end fails it as
+  `upstream_closed_early`. Once the body has stopped arriving, the sink has the
+  destination's `timeout` to return. Live: 50 of 50 concurrent uploads of up to 4 MiB
+  committed with the exact bytes into an in-process sink.
+- **Filesystem sink.** `mcp_upload.sinks.filesystem(directory, name_template=...,
+  overwrite=False, fsync=True)` writes to a `.upload-*.part` file in the directory
+  (mode 0600), syncs it, and links or renames it into place only after a normal end,
+  then syncs the directory. On any failure the temporary file is deleted. It never
+  replaces an existing file unless asked, refuses names outside its directory, and does
+  its file work on its own thread pool. Live: 50 of 50 concurrent uploads written with
+  the exact bytes; in a mixed run of 20 honest uploads, 10 clients that vanished
+  mid-body, 10 oversize bodies and 10 wrong declared digests, the 20 honest files were
+  written correctly, none of the 30 failures left a file, and no temporary file
+  remained.
+- **Raw-body uploads.** `UploadGateway(raw_uploads=True)` also accepts a POST or PUT
+  whose body is the file. The media type is the Content-Type, held to the same token
+  grammar and accept list, and checked before the ticket is spent. The filename comes
+  from `Content-Disposition` (RFC 8187 `filename*` first) or a `filename` query
+  parameter. Every existing limit applies, and the declared length is held to
+  `max_size` exactly. URL-encoded forms are never taken as files. Off by default, with
+  the old behaviour unchanged. `describe(issued, raw=True)` returns a PUT transfer
+  descriptor with no `multipart` key. Live: 30 of 30 raw uploads completed with the
+  right bytes and names; oversize, wrong-digest, wrong-type, URL-encoded and vanished
+  uploads were all refused, the header-only refusals left their tickets unspent, and
+  nothing refused was committed.
+- **Upload page progress.** The form now has drag and drop, a progress bar and an
+  in-place result, from one inline script admitted by a per-response CSP nonce. The
+  policy is otherwise unchanged apart from `connect-src 'self'`, there are no inline
+  handlers, and the plain form still posts with scripts off. In headless Chrome the
+  script ran with no CSP violation, reported progress through a throttled 24 MiB
+  upload, and showed both a completed upload and a `too_large` refusal.
+- **`sink_failed`** in `ERROR_STATUS`. `IncomingFile`, `UploadAborted` and `Sink` are
+  exported from the package root.
+
+**Changed**
+
+- `Destination.url` is now optional (it is `None` for a sink). Positional construction
+  as `Destination(name, url)` still works.
+
 ## 0.5.0 (2026-10-03)
 
 Speed and scale in the stores, and hooks for what happens after an upload. Measured

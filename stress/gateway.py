@@ -1,7 +1,13 @@
 """The gateway under test, run as its own process so its memory can be watched from
 outside. It serves the real upload endpoint plus harness-only routes: one that mints a
 ticket the way a tool would, one that reads a record's status, one that claims a
-record, and one that says which of those features the installed version has.
+record, one that says which of those features the installed version has, one that
+counts completion hook calls (``--hook``), and one that reports what a function
+destination (``--sink``) committed.
+
+With ``--sink memory`` the ``files`` destination is an in-process function that hashes
+what it reads and commits only on a normal end. With ``--sink filesystem`` it is the
+library's filesystem sink, writing to ``--sink-dir`` with the record id as the name.
 
 Options the installed version does not know are dropped, so the same harness runs
 against old and new releases and each runs on its own defaults. A request for a
@@ -12,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import inspect
 import os
 import tempfile
@@ -29,14 +36,88 @@ import mcp_upload
 from mcp_upload import Destination, MemoryStore, Registry, SqliteStore, UploadGateway
 
 
+def sink_support() -> dict[str, bool]:
+    fields = inspect.signature(Destination).parameters
+    try:
+        from mcp_upload.sinks import filesystem  # noqa: F401
+    except ImportError:
+        has_filesystem = False
+    else:
+        has_filesystem = True
+    return {"sink": "sink" in fields, "filesystem_sink": has_filesystem}
+
+
+class MemorySink:
+    """Reads every chunk, hashes it, and commits only when iteration ends normally."""
+
+    def __init__(self) -> None:
+        self.commits: dict[str, dict[str, Any]] = {}
+        self.aborted: Counter[str] = Counter()
+        self.calls = 0
+
+    async def __call__(self, upload: Any) -> None:
+        from mcp_upload.sinks import UploadAborted
+
+        self.calls += 1
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            async for chunk in upload:
+                digest.update(chunk)
+                size += len(chunk)
+        except UploadAborted as exc:
+            self.aborted[exc.code] += 1
+            raise
+        self.commits[upload.record_id] = {"size": size, "sha256": digest.hexdigest()}
+
+    def stats(self) -> dict[str, Any]:
+        return {"commits": self.commits, "aborted": dict(self.aborted), "calls": self.calls}
+
+
+def directory_stats(directory: str) -> dict[str, Any]:
+    commits: dict[str, Any] = {}
+    temp = []
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
+        if name.startswith("."):
+            temp.append(name)
+            continue
+        with open(path, "rb") as f:
+            commits[name] = {
+                "size": os.path.getsize(path),
+                "sha256": hashlib.file_digest(f, "sha256").hexdigest(),
+            }
+    return {"commits": commits, "temp_files": len(temp)}
+
+
 def build(args: argparse.Namespace) -> Starlette:
-    registry = Registry(
-        Destination(
+    support = sink_support()
+    sink: Any = None
+    sink_stats: Any = None
+    if args.sink == "memory" and support["sink"]:
+        memory = MemorySink()
+        sink, sink_stats = memory, memory.stats
+    elif args.sink == "filesystem" and support["filesystem_sink"]:
+        from mcp_upload.sinks import filesystem
+
+        directory = args.sink_dir or tempfile.mkdtemp()
+        sink = filesystem(directory, name_template="{id}")
+
+        def sink_stats() -> dict[str, Any]:
+            return directory_stats(directory)
+
+    files = (
+        Destination(name="files", sink=sink, max_size=args.max_size, timeout=args.dest_timeout)
+        if sink is not None
+        else Destination(
             name="files",
             url=f"{args.backend}/files/{{id}}",
             max_size=args.max_size,
             timeout=args.dest_timeout,
-        ),
+        )
+    )
+    registry = Registry(
+        files,
         Destination(
             name="images",
             url=f"{args.backend}/files/{{id}}",
@@ -90,6 +171,8 @@ def build(args: argparse.Namespace) -> Starlette:
         options["upload_timeout"] = timedelta(seconds=args.upload_timeout)
     if args.hook:
         options["on_complete"] = on_complete
+    if args.raw_uploads:
+        options["raw_uploads"] = True
     accepted = inspect.signature(UploadGateway.__init__).parameters
     gateway = UploadGateway(**{k: v for k, v in options.items() if k in accepted})
     issue_params = inspect.signature(gateway.issue).parameters
@@ -106,6 +189,10 @@ def build(args: argparse.Namespace) -> Starlette:
         "store": args.store,
         "redis_options": redis_options,
         "redis_pool": args.redis_pool if args.store == "redis" else None,
+        "raw_uploads": "raw_uploads" in accepted,
+        "raw_uploads_on": bool(args.raw_uploads) and "raw_uploads" in accepted,
+        **support,
+        "sink_active": args.sink if sink is not None else None,
     }
 
     def unsupported(name: str) -> JSONResponse:
@@ -167,6 +254,11 @@ def build(args: argparse.Namespace) -> Starlette:
             return unsupported("on_complete")
         return JSONResponse({"counts": dict(hooks), "total": sum(hooks.values())})
 
+    async def sink_report(request: Request) -> JSONResponse:
+        if sink_stats is None:
+            return unsupported("sink")
+        return JSONResponse(sink_stats())
+
     return Starlette(
         routes=[
             *gateway.routes(),
@@ -176,6 +268,7 @@ def build(args: argparse.Namespace) -> Starlette:
             Route("/_caps", capabilities),
             Route("/_version", version),
             Route("/_hooks", hook_counts),
+            Route("/_sink_stats", sink_report),
         ]
     )
 
@@ -207,6 +300,9 @@ def main() -> None:
     )
     parser.add_argument("--hook", action="store_true", help="count on_complete calls")
     parser.add_argument("--hook-delay", type=float, default=0.0, help="seconds the hook sleeps")
+    parser.add_argument("--sink", choices=["memory", "filesystem"], default=None)
+    parser.add_argument("--sink-dir", default=None, help="directory for --sink filesystem")
+    parser.add_argument("--raw-uploads", action="store_true")
     args = parser.parse_args()
     uvicorn.run(build(args), host="127.0.0.1", port=args.port, log_level="warning", backlog=4096)
 

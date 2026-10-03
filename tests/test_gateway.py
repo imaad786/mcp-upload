@@ -11,6 +11,7 @@ import base64
 import hashlib
 import inspect
 import logging
+from collections.abc import AsyncIterator
 from datetime import timedelta
 
 import httpx
@@ -18,6 +19,8 @@ import pytest
 from starlette.applications import Starlette
 
 from mcp_upload import (
+    Destination,
+    IncomingFile,
     Issued,
     MemoryStore,
     Record,
@@ -27,6 +30,7 @@ from mcp_upload import (
     UploadGateway,
 )
 from mcp_upload.multipart import parse_content_type, sanitize_filename
+from mcp_upload.telemetry import Telemetry
 from tests.conftest import BASE_URL, Upstream, multipart
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
@@ -569,3 +573,92 @@ async def test_on_complete_sees_every_terminal_record_after_the_response(
             ]
         await http.aclose()
     assert seen == expected
+
+
+class RecordingTelemetry(Telemetry):
+    """Keeps what the gateway reports instead of sending it anywhere."""
+
+    def __init__(self) -> None:
+        super().__init__(enabled=False)
+        self.finished_uploads: list[tuple[str, str, int]] = []
+        self.refusals: list[str] = []
+
+    def refused(self, code: str) -> None:
+        self.refusals.append(code)
+
+    def finished(
+        self, span: object, destination: str, outcome: str, size: int, seconds: float
+    ) -> None:
+        self.finished_uploads.append((destination, outcome, size))
+
+
+async def test_on_complete_and_telemetry_cover_sinks_and_raw_uploads(upstream: Upstream) -> None:
+    async def keep(upload: IncomingFile) -> None:
+        async for _ in upload:
+            pass
+
+    async def broken(upload: IncomingFile) -> None:
+        raise RuntimeError("disk full")
+
+    registry = Registry(
+        Destination(name="files", url="http://backend.test/files/{id}", max_size=1000),
+        Destination(name="kept", sink=keep, max_size=1000),
+        Destination(name="broken", sink=broken),
+    )
+    seen: list[tuple[str, Status, str | None]] = []
+
+    async def hook(record: Record) -> None:
+        seen.append((record.id, record.status, record.outcome.error if record.outcome else None))
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(upstream.handler))
+    gw = UploadGateway(
+        base_url=BASE_URL,
+        registry=registry,
+        store=MemoryStore(),
+        http=http,
+        on_complete=hook,
+        raw_uploads=True,
+    )
+    telemetry = RecordingTelemetry()
+    gw._telemetry = telemetry
+    app = Starlette(routes=gw.routes())
+    octet = {"Content-Type": "application/octet-stream"}
+
+    async def chunked() -> AsyncIterator[bytes]:
+        # No Content-Length, so the size limit is met only on the bytes.
+        yield b"x" * 600
+        yield b"y" * 600
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE_URL) as c:
+        sink_ok = await issue(gw, "kept")
+        sink_bad = await issue(gw, "broken")
+        raw_ok = await issue(gw, "files")
+        raw_big = await issue(gw, "files")
+        raw_sink = await issue(gw, "kept")
+        unspent = await issue(gw, "files")
+        statuses = [
+            (await post(c, sink_ok.upload_url, [("file", "a.txt", b"abc", "text/plain")])),
+            (await post(c, sink_bad.upload_url, [("file", "b.txt", b"abc", "text/plain")])),
+            (await c.put(raw_ok.upload_url, content=b"raw bytes", headers=octet)),
+            (await c.put(raw_big.upload_url, content=chunked(), headers=octet)),
+            (await c.put(raw_sink.upload_url, content=b"into a sink", headers=octet)),
+            # Refused on its headers: the ticket is not spent, so there is nothing final.
+            (await c.put(unspent.upload_url, content=b"x" * 2000, headers=octet)),
+        ]
+    await http.aclose()
+    assert [r.status_code for r in statuses] == [200, 502, 200, 413, 200, 413]
+    assert seen == [
+        (sink_ok.record.id, Status.COMPLETED, None),
+        (sink_bad.record.id, Status.FAILED, "sink_failed"),
+        (raw_ok.record.id, Status.COMPLETED, None),
+        (raw_big.record.id, Status.FAILED, "too_large"),
+        (raw_sink.record.id, Status.COMPLETED, None),
+    ]
+    assert telemetry.finished_uploads == [
+        ("kept", "completed", 3),
+        ("broken", "sink_failed", 3),
+        ("files", "completed", 9),
+        ("files", "too_large", 1200),
+        ("kept", "completed", 11),
+    ]
+    assert telemetry.refusals == ["too_large"]

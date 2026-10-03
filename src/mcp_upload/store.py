@@ -187,16 +187,17 @@ _SELECT_BY = {
     "ticket_hash": "SELECT * FROM tickets WHERE ticket_hash = ?",
 }
 
-_COLUMNS = (
-    "id, ticket_hash, destination, caller, issued_at, expires_at, retention_until,"
-    " constraints, status, redeemed_at, finished_at, outcome, owner, claimed_at"
+_INSERT = (
+    "INSERT INTO tickets (id, ticket_hash, destination, caller, issued_at, expires_at,"
+    " retention_until, constraints, status, redeemed_at, finished_at, outcome, owner,"
+    " claimed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
-_PLACEHOLDERS = ", ".join("?" * 14)
-_INSERT = f"INSERT INTO tickets ({_COLUMNS}) VALUES ({_PLACEHOLDERS})"
 # The cap check and the insert are one statement, so two writers in different processes
 # cannot both see room for one more record and both take it.
 _INSERT_CAPPED = (
-    f"INSERT INTO tickets ({_COLUMNS}) SELECT {_PLACEHOLDERS}"
+    "INSERT INTO tickets (id, ticket_hash, destination, caller, issued_at, expires_at,"
+    " retention_until, constraints, status, redeemed_at, finished_at, outcome, owner,"
+    " claimed_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
     " WHERE (SELECT n FROM ticket_count WHERE id = 0) < ?"
 )
 

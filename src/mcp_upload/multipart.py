@@ -18,8 +18,10 @@ import re
 import unicodedata
 from collections.abc import Mapping
 from pathlib import PurePosixPath
+from urllib.parse import unquote
 
 MULTIPART_FORM_DATA = "multipart/form-data"
+FORM_URLENCODED = "application/x-www-form-urlencoded"
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 # Unicode categories that render as nothing or rearrange text: controls, format
@@ -55,6 +57,49 @@ def multipart_error(headers: Mapping[str, str]) -> str | None:
     if not boundary.isascii():
         return "bad_multipart"
     return None
+
+
+def raw_body_allowed(headers: Mapping[str, str]) -> bool:
+    """Whether a request that ``multipart_error`` refused may be taken as a raw upload,
+    with the body as the file. A URL-encoded form never is: it is what a browser form
+    without an enctype and ``curl --data`` send, and reading it as a file is how a text
+    field becomes file content. Other multipart types are not files either."""
+    media_type, _ = parse_content_type(headers.get("content-type"))
+    return media_type != FORM_URLENCODED and not media_type.startswith("multipart/")
+
+
+# One ``; name=value`` parameter of a Content-Disposition header, where the value is a
+# token or a quoted string that may contain semicolons and escaped quotes.
+_DISPOSITION_PARAM = re.compile(
+    r";\s*([!#$%&'*+.^_`|~0-9A-Za-z-]+)\s*=\s*(\"(?:[^\"\\]|\\.)*\"|[^;]*)"
+)
+
+
+def filename_from_disposition(value: str | None) -> str | None:
+    """The filename a ``Content-Disposition`` request header names, unsanitized.
+
+    The RFC 8187 form ``filename*=UTF-8''%E2%82%AC.pdf`` wins over plain ``filename``,
+    as RFC 6266 says, when its charset is UTF-8 or ISO-8859-1 and it decodes cleanly.
+    Otherwise the plain form is used. None when neither is present.
+    """
+    if not value:
+        return None
+    params: dict[str, str] = {}
+    for key, raw in _DISPOSITION_PARAM.findall(value):
+        val = raw.strip()
+        if len(val) >= 2 and val[0] == val[-1] == '"':
+            val = re.sub(r"\\(.)", r"\1", val[1:-1])
+        params.setdefault(key.lower(), val)
+    extended = params.get("filename*")
+    if extended:
+        charset, _, rest = extended.partition("'")
+        _, quote, encoded = rest.partition("'")
+        if quote and charset.lower() in ("utf-8", "iso-8859-1"):
+            try:
+                return unquote(encoded, encoding=charset.lower(), errors="strict")
+            except (UnicodeDecodeError, LookupError):
+                pass
+    return params.get("filename") or None
 
 
 def boundary_of(headers: Mapping[str, str]) -> str:
