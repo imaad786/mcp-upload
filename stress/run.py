@@ -16,17 +16,22 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
 import os
 import random
+import re
 import socket
+import sqlite3
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import unicodedata
 from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -731,6 +736,387 @@ async def chaos(src: str) -> dict[str, Any]:
     )
 
 
+# ----- 0.4.0 features: declared digests, owners, claims, abandoned records ----------------
+#
+# Each of these asks the gateway for its capabilities first and reports
+# ``{"supported": false}`` on a version that lacks the feature.
+
+OLD_SRC: str | None = None  # set by --old-src, for sqlite_migration
+
+
+def b64url_of(hex_digest: str) -> str:
+    return base64.urlsafe_b64encode(bytes.fromhex(hex_digest)).rstrip(b"=").decode()
+
+
+def digest_matches(value: str, hex_digest: str) -> bool:
+    """A reported digest value, hex or base64url, against a hex SHA-256."""
+    if re.fullmatch(r"[0-9a-f]{64}", value):
+        return value == hex_digest
+    if re.fullmatch(r"[A-Za-z0-9_-]{43}", value):
+        return base64.urlsafe_b64decode(value + "=").hex() == hex_digest
+    return False
+
+
+async def capabilities(stack: Stack) -> dict[str, Any]:
+    return await get_json(stack.gateway_port, "/_caps")
+
+
+async def status_of(stack: Stack, record_id: str, owner: str | None = None) -> dict[str, Any]:
+    query = f"?owner={owner}" if owner is not None else ""
+    return await get_json(stack.gateway_port, f"/_status/{record_id}{query}")
+
+
+async def claim(stack: Stack, record_id: str, owner: str | None = None) -> dict[str, Any]:
+    query = f"?owner={owner}" if owner is not None else ""
+    return (await http(stack.gateway_port, "POST", f"/_claim/{record_id}{query}")).body
+
+
+def unsupported(stack: Stack, missing: list[str]) -> dict[str, Any]:
+    return finish(stack, {"supported": False, "missing": missing})
+
+
+def lacking(caps: dict[str, Any], *names: str) -> list[str]:
+    return [n for n in names if not caps.get(n)]
+
+
+async def send(stack: Stack, ticket: dict[str, Any], body: Body, **kw: Any) -> Reply:
+    reply = await http(stack.gateway_port, "POST", ticket["path"], headers=CT, body=body, **kw)
+    reply.body.setdefault("id", ticket.get("id"))
+    return reply
+
+
+def named_body(data: bytes, filename: str, media_type: str = "application/octet-stream") -> Body:
+    async def gen() -> AsyncIterator[bytes]:
+        yield part_head(filename, media_type) + data + TAIL
+
+    return gen
+
+
+@scenario
+async def digest_integrity(src: str) -> dict[str, Any]:
+    """250 concurrent uploads with a declared digest or size. 100 match, 100 declare the
+    wrong digest, 50 the wrong size (25 one byte over, 25 one byte under). A mismatch
+    must be refused and must never reach a backend commit."""
+    stack = start(src, max_in_flight=300)
+    caps = await capabilities(stack)
+    if missing := lacking(caps, "expected_size", "expected_digest"):
+        return unsupported(stack, missing)
+    size = 256 * 1024
+    jobs: list[tuple[str, dict[str, Any], Body, str]] = []
+    for i in range(250):
+        body, digest = file_body(size, seed=1000 + i)
+        if i < 100:
+            kind, declared = (
+                "match",
+                {
+                    "expected_digest": {"algorithm": "sha-256", "value": b64url_of(digest)},
+                    "expected_size": size,
+                },
+            )
+        elif i < 200:
+            wrong = hashlib.sha256(f"other {i}".encode()).hexdigest()
+            kind, declared = (
+                "wrong_digest",
+                {"expected_digest": b64url_of(wrong), "expected_size": size},
+            )
+        elif i < 225:
+            kind, declared = "size_over", {"expected_size": size + 1}
+        else:
+            kind, declared = "size_under", {"expected_size": size - 1}
+        ticket = await issue(stack, **declared)
+        jobs.append((kind, ticket, body, digest))
+    replies = await asyncio.gather(*(send(stack, t, b) for _, t, b, _ in jobs))
+    await asyncio.sleep(1)
+    commits = (await backend(stack))["commits"]
+    by_kind: dict[str, Counter[str]] = {}
+    committed_despite_mismatch = 0
+    match_integrity_bad = 0
+    http_codes: dict[str, Counter[int]] = {}
+    for (kind, ticket, _, digest), reply in zip(jobs, replies, strict=True):
+        by_kind.setdefault(kind, Counter())[
+            reply.body.get("error") or reply.body.get("status") or reply.error or "?"
+        ] += 1
+        http_codes.setdefault(kind, Counter())[reply.status] += 1
+        if kind == "match":
+            if commits.get(ticket["id"], {}).get("sha256") != digest:
+                match_integrity_bad += 1
+        elif ticket["id"] in commits:
+            committed_despite_mismatch += 1
+    return finish(
+        stack,
+        {
+            "supported": True,
+            "outcomes_by_kind": {k: dict(v) for k, v in by_kind.items()},
+            "http_status_by_kind": {k: dict(v) for k, v in http_codes.items()},
+            "match_completed_but_bytes_wrong": match_integrity_bad,
+            "committed_despite_mismatch": committed_despite_mismatch,
+            "backend_commits": len(commits),
+        },
+    )
+
+
+@scenario
+async def owner_isolation(src: str) -> dict[str, Any]:
+    """50 records owned by alice, uploaded. Bob must see each as unknown and must not
+    claim it. Alice and an owner-less query see it completed."""
+    stack = start(src)
+    caps = await capabilities(stack)
+    if missing := lacking(caps, "owner", "status_owner", "claim"):
+        return unsupported(stack, missing)
+    tickets = [await issue(stack, owner="alice") for _ in range(50)]
+    replies = await asyncio.gather(
+        *(send(stack, t, file_body(4096, seed=i)[0]) for i, t in enumerate(tickets))
+    )
+    ids = [t["id"] for t in tickets]
+    bob = [await status_of(stack, i, "bob") for i in ids]
+    alice = [await status_of(stack, i, "alice") for i in ids]
+    anyone = [await status_of(stack, i) for i in ids]
+    bob_claims = [await claim(stack, i, "bob") for i in ids]
+    after = [await status_of(stack, i, "alice") for i in ids]
+    alice_claims = [await claim(stack, i, "alice") for i in ids]
+    return finish(
+        stack,
+        {
+            "supported": True,
+            "upload_outcomes": outcomes(list(replies)),
+            "bob_status": dict(Counter(s.get("status") for s in bob)),
+            "bob_status_leaks": sum(s.get("status") != "unknown" or len(s) > 2 for s in bob),
+            "alice_status": dict(Counter(s.get("status") for s in alice)),
+            "no_owner_status": dict(Counter(s.get("status") for s in anyone)),
+            "bob_claim_results": dict(
+                Counter(
+                    c.get("refused") or ("claimed" if c.get("claimed") else "?") for c in bob_claims
+                )
+            ),
+            "bob_claim_wins": sum(bool(c.get("claimed")) for c in bob_claims),
+            "status_after_bob_claims": dict(Counter(s.get("status") for s in after)),
+            "alice_claim_wins": sum(bool(c.get("claimed")) for c in alice_claims),
+        },
+    )
+
+
+@scenario
+async def claim_race(src: str) -> dict[str, Any]:
+    """50 completed uploads per store, then 20 concurrent claims on each record. Exactly
+    one claim per record may win. Run on the memory store and the SQLite store."""
+    result: dict[str, Any] = {"supported": True}
+    for store in ("memory", "sqlite"):
+        stack = start(src, store=store)
+        caps = await capabilities(stack)
+        if missing := lacking(caps, "claim"):
+            return unsupported(stack, missing)
+        tickets = [await issue(stack) for _ in range(50)]
+        replies = await asyncio.gather(
+            *(send(stack, t, file_body(4096, seed=i)[0]) for i, t in enumerate(tickets))
+        )
+        winners: Counter[int] = Counter()
+        refusals: Counter[str] = Counter()
+        for t in tickets:
+            claims = await asyncio.gather(*(claim(stack, t["id"]) for _ in range(20)))
+            winners[sum(bool(c.get("claimed")) for c in claims)] += 1
+            refusals.update(c["refused"] for c in claims if "refused" in c)
+        statuses = Counter([(await status_of(stack, t["id"])).get("status") for t in tickets])
+        result[store] = finish(
+            stack,
+            {
+                "upload_outcomes": outcomes(list(replies)),
+                "records_by_winner_count": {str(k): v for k, v in sorted(winners.items())},
+                "total_wins": sum(k * v for k, v in winners.items()),
+                "refusals": dict(refusals),
+                "status_after": dict(statuses),
+            },
+        )
+    return result
+
+
+@scenario
+async def abandoned_after_crash(src: str) -> dict[str, Any]:
+    """A slow upload is mid-stream when the gateway is SIGKILLed. A new gateway on the
+    same SQLite file (upload_timeout 2 s) reads the record right away and again once
+    redeemed_at + upload_timeout + 30 s has passed. The first gateway runs with a 60 s
+    upload_timeout so its own watchdog cannot end the upload before the kill."""
+    db = os.path.join(tempfile.mkdtemp(), "tickets.db")
+    first = start(src, store="sqlite", db=db, upload_timeout=60)
+
+    async def slow() -> AsyncIterator[bytes]:
+        yield part_head("slow.bin")
+        chunk = b"s" * (128 * 1024)
+        for _ in range(60):
+            yield chunk
+            await asyncio.sleep(2)
+        yield TAIL
+
+    ticket = await issue(first)
+    t0 = time.monotonic()
+    task = asyncio.create_task(send(first, ticket, slow, timeout=120))
+    await asyncio.sleep(3)
+    upstream = (await backend(first))["concurrent"]
+    before_kill = await status_of(first, ticket["id"])
+    first.gateway.kill()
+    first.gateway.wait(5)
+    client = await task
+    second = start(src, store="sqlite", db=db, upload_timeout=2)
+    right_after = await status_of(second, ticket["id"])
+    # redeemed_at is a moment after t0. Sleep to just past the abandon point, then poll.
+    await asyncio.sleep(max(0.0, t0 + 2 + 30 + 1 - time.monotonic()))
+    after_wait = await status_of(second, ticket["id"])
+    for _ in range(8):
+        if after_wait.get("status") != "redeemed":
+            break
+        await asyncio.sleep(1)
+        after_wait = await status_of(second, ticket["id"])
+    commits = (await backend(first))["commits"]
+    finish(first, {})
+    return finish(
+        second,
+        {
+            "backend_requests_open_at_kill": upstream,
+            "status_before_kill": before_kill,
+            "client_saw": {"http": client.status, "error": client.error, "body": client.body},
+            "status_right_after_restart": right_after,
+            "status_after_wait": after_wait,
+            "waited_s": round(time.monotonic() - t0, 1),
+            "backend_committed": ticket["id"] in commits,
+        },
+    )
+
+
+@scenario
+async def error_details(src: str) -> dict[str, Any]:
+    """Three refusals, and the machine-readable ``details`` each one carries: an
+    oversize upload (max_size 1 MiB), a text file into the image destination, and a
+    declared digest that does not match (where supported)."""
+    stack = start(src, max_size=MB)
+    caps = await capabilities(stack)
+    cases: dict[str, Any] = {}
+
+    async def run(name: str, issue_kw: dict[str, Any], body: Body) -> None:
+        ticket = await issue(stack, **issue_kw)
+        if "path" not in ticket:
+            cases[name] = {"issue": ticket}
+            return
+        reply = await send(stack, ticket, body)
+        stored = await status_of(stack, ticket["id"])
+        cases[name] = {
+            "http": reply.status,
+            "error": reply.body.get("error"),
+            "details": reply.body.get("details", "none returned"),
+            "status_details": stored.get("details", "none returned"),
+        }
+
+    await run("oversize", {}, file_body(2 * MB, seed=1)[0])
+    await run(
+        "wrong_media_type",
+        {"destination": "images"},
+        named_body(b"just text", "notes.txt", "text/plain"),
+    )
+    if caps.get("expected_digest"):
+        wrong = b64url_of(hashlib.sha256(b"something else").hexdigest())
+        await run("digest_mismatch", {"expected_digest": wrong}, named_body(b"hello", "h.txt"))
+    else:
+        cases["digest_mismatch"] = {"supported": False}
+    return finish(stack, cases)
+
+
+@scenario
+async def digest_format(src: str) -> dict[str, Any]:
+    """The digest a completed upload reports: hex or base64url, and does it decode to the
+    SHA-256 of the bytes sent."""
+    stack = start(src)
+    body, digest = file_body(100 * 1024, seed=5)
+    reply = await upload(stack, body)
+    value = str(reply.body.get("file", {}).get("digest", {}).get("value", ""))
+    is_hex = bool(re.fullmatch(r"[0-9a-f]{64}", value))
+    is_b64 = bool(re.fullmatch(r"[A-Za-z0-9_-]{43}", value))
+    matches = digest_matches(value, digest)
+    return finish(
+        stack,
+        {
+            "outcome": reply.body.get("status") or reply.body.get("error"),
+            "digest": reply.body.get("file", {}).get("digest"),
+            "format": "hex" if is_hex else "base64url" if is_b64 else "other",
+            "matches_sha256_of_bytes_sent": matches,
+        },
+    )
+
+
+@scenario
+async def filename_hygiene(src: str) -> dict[str, Any]:
+    """Names the gateway passes on: a right-to-left override, a 300-character name in a
+    two-byte script, and a decomposed accent."""
+    stack = start(src)
+    names = {
+        "rtl_override": "invoice‮gpj.exe",
+        "long_multibyte": "é" * 300 + ".txt",
+        "decomposed": "café.txt",
+    }
+    result: dict[str, Any] = {}
+    for key, name in names.items():
+        reply = await upload(stack, named_body(b"data", name))
+        got = reply.body.get("file", {}).get("name")
+        entry: dict[str, Any] = {"outcome": reply.body.get("status") or reply.body.get("error")}
+        if isinstance(got, str):
+            entry |= {
+                "name": got if len(got) < 40 else got[:12] + "..." + got[-8:],
+                "chars": len(got),
+                "utf8_bytes": len(got.encode()),
+                "has_u202e": "‮" in got,
+                "is_nfc": unicodedata.is_normalized("NFC", got),
+            }
+        result[key] = entry
+    return finish(stack, result)
+
+
+@scenario
+async def sqlite_migration(src: str) -> dict[str, Any]:
+    """A database written by the old release (``--old-src``), then opened by ``src``: the
+    old completed record must still read completed, an old unused ticket must still
+    redeem, and a new upload must work in the same file."""
+    if OLD_SRC is None:
+        return {"supported": False, "reason": "no --old-src given"}
+    db = os.path.join(tempfile.mkdtemp(), "tickets.db")
+    old = start(OLD_SRC, store="sqlite", db=db)
+    old_body, old_digest = file_body(50_000, seed=11)
+    old_reply = await upload(old, old_body)
+    spare = await issue(old)
+    finish(old, {})
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        old_columns = [row[1] for row in conn.execute("PRAGMA table_info(tickets)")]
+    new = start(src, store="sqlite", db=db)
+    caps = await capabilities(new)
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        new_columns = [row[1] for row in conn.execute("PRAGMA table_info(tickets)")]
+    old_status = await status_of(new, old_reply.body["id"])
+    spare_body, spare_digest = file_body(30_000, seed=12)
+    spare_reply = await send(new, spare, spare_body)
+    new_body, new_digest = file_body(40_000, seed=13)
+    new_reply = await upload(new, new_body)
+    new_status = await status_of(new, new_reply.body["id"])
+    claimed = await claim(new, old_reply.body["id"]) if caps.get("claim") else None
+    commits = (await backend(new))["commits"]
+    return finish(
+        new,
+        {
+            "trivial": Path(OLD_SRC).resolve() == Path(src).resolve(),
+            "old_upload": old_reply.body.get("status") or old_reply.body.get("error"),
+            "columns_before": old_columns,
+            "columns_added": [c for c in new_columns if c not in old_columns],
+            "old_record_status_in_new": old_status.get("status"),
+            "old_record_size_ok": old_status.get("file", {}).get("size") == 50_000,
+            "old_unused_ticket_in_new": spare_reply.body.get("status")
+            or spare_reply.body.get("error"),
+            "old_ticket_bytes_ok": commits.get(spare["id"], {}).get("sha256") == spare_digest,
+            "new_upload": new_reply.body.get("status") or new_reply.body.get("error"),
+            "new_record_status": new_status.get("status"),
+            "new_bytes_ok": commits.get(new_reply.body["id"], {}).get("sha256") == new_digest,
+            "claim_old_record": claimed if claimed is not None else "claim unsupported",
+            "old_record_digest_ok": digest_matches(
+                str(old_status.get("file", {}).get("digest", {}).get("value", "")), old_digest
+            ),
+        },
+    )
+
+
 # ----- main -----------------------------------------------------------------------------
 
 
@@ -739,16 +1125,24 @@ async def main() -> None:
     parser.add_argument("--src", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--only", default="")
+    parser.add_argument("--old-src", default=None, help="older tree, for sqlite_migration")
     args = parser.parse_args()
     src = str(Path(args.src).resolve())
+    global OLD_SRC
+    OLD_SRC = str(Path(args.old_src).resolve()) if args.old_src else None
     version = subprocess.run(
-        [sys.executable, "-c", "import mcp_upload;print(mcp_upload.__version__)"],
+        [
+            sys.executable,
+            "-c",
+            "import mcp_upload as m;"
+            "print(m.__version__ + ('+claim' if hasattr(m, 'ClaimRefused') else ''))",
+        ],
         env={**os.environ, "PYTHONPATH": src},
         capture_output=True,
         text=True,
     ).stdout.strip()
     names = [n for n in args.only.split(",") if n] or list(SCENARIOS)
-    results: dict[str, Any] = {"version": version, "src": src, "scenarios": {}}
+    results: dict[str, Any] = {"version": version, "src": src, "old_src": OLD_SRC, "scenarios": {}}
     for name in names:
         print(f"[{version}] {name} ...", flush=True)
         t = time.perf_counter()

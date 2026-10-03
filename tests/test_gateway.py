@@ -7,6 +7,7 @@ upload.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import inspect
 import logging
@@ -60,7 +61,7 @@ async def test_upload_streams_to_the_destination_and_records_the_outcome(
     assert body["file"]["size"] == len(data)
     assert body["file"]["digest"] == {
         "algorithm": "sha-256",
-        "value": hashlib.sha256(data).hexdigest(),
+        "value": base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode(),
     }
     assert body["file"]["uri"] == f"mcp-file://test/{issued.record.id}"
 
@@ -520,4 +521,4 @@ def test_sanitize_filename(value: str | None, expected: str) -> None:
 
 
 async def test_record_states_are_the_documented_set() -> None:
-    assert [s.value for s in Status] == ["issued", "redeemed", "completed", "failed"]
+    assert [s.value for s in Status] == ["issued", "redeemed", "completed", "failed", "claimed"]

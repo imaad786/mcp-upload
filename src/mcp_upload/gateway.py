@@ -48,17 +48,20 @@ from .destinations import Destination, Registry, UnknownDestination
 from .multipart import Framer, boundary_of, multipart_error, sanitize_filename
 from .store import Store, StoreFull
 from .tickets import (
+    ClaimError,
     Constraints,
     Outcome,
     Record,
     RedeemError,
     Status,
+    b64url,
     hash_secret,
     new_id,
     new_secret,
+    sha256_hex,
     utcnow,
 )
-from .types import AwaitingUpload, FileTransferDescriptor, FileValue, UploadStatus
+from .types import AwaitingUpload, FileDigest, FileTransferDescriptor, FileValue, UploadStatus
 
 # The library logs through this name. Records are identified by their public id only.
 # The ticket secret and the upload URL never appear in a log line.
@@ -96,6 +99,8 @@ ERROR_STATUS: dict[str, int] = {
     "ticket_used": 410,
     "ticket_expired": 410,
     "too_large": 413,
+    "digest_mismatch": 422,
+    "size_mismatch": 422,
     "part_headers_too_large": 400,
     "too_slow": 408,
     "upload_timeout": 408,
@@ -121,14 +126,31 @@ class UploadError(Exception):
     """A failure with a code from ``ERROR_STATUS``. The code is what gets stored and
     returned. The message is for logs only."""
 
-    def __init__(self, code: str, message: str = "", *, upstream_status: int | None = None):
+    def __init__(
+        self,
+        code: str,
+        message: str = "",
+        *,
+        upstream_status: int | None = None,
+        details: dict[str, Any] | None = None,
+    ):
         super().__init__(message or code)
         self.code = code
         self.upstream_status = upstream_status
+        self.details = details
 
     @property
     def http_status(self) -> int:
         return ERROR_STATUS.get(self.code, 500)
+
+
+class ClaimRefused(Exception):
+    """``UploadGateway.claim`` could not claim the record. ``reason`` says why:
+    not_found (no such record, or another owner's), not_completed, or already_claimed."""
+
+    def __init__(self, reason: ClaimError):
+        super().__init__(reason.value)
+        self.reason = reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,11 +252,26 @@ class UploadGateway:
         destination: str,
         *,
         caller: str | None = None,
+        owner: str | None = None,
         ttl: timedelta | None = None,
         max_size: int | None = None,
         accept: tuple[str, ...] | None = None,
+        expected_size: int | None = None,
+        expected_digest: FileDigest | str | None = None,
     ) -> Issued:
         """Mint a ticket for ``destination``, which must be a registered name.
+
+        ``owner`` binds the record to whoever asked for it, typically the
+        authenticated user. ``status`` and ``claim`` then answer only that owner, and
+        report the record as unknown to anyone else, so an id seen in a transcript
+        does not leak a file's name, size or digest to another user.
+
+        ``expected_size`` and ``expected_digest`` are what the uploader declared in
+        advance, as SEP-2631's ``files/authorizeUpload`` carries them. The digest is a
+        ``FileDigest`` or a bare base64url SHA-256. An upload whose bytes do not match
+        is refused with ``size_mismatch`` or ``digest_mismatch`` before the backend
+        sees the end of the body, so a backend that commits only complete bodies never
+        stores it.
 
         Per-ticket limits can only tighten the destination's defaults. A tool that
         passes a larger ``max_size`` than the destination allows gets the destination's.
@@ -248,7 +285,19 @@ class UploadGateway:
             if max_size < 0:
                 raise ValueError("max_size must not be negative")
             limit = max_size if limit is None else min(limit, max_size)
-        constraints = Constraints(max_size=limit, accept=_narrow(dest.accept, accept))
+        expected_sha256 = _expected_sha256(expected_digest)
+        if expected_size is not None:
+            if expected_size < 0:
+                raise ValueError("expected_size must not be negative")
+            if limit is not None and expected_size > limit:
+                raise ValueError("expected_size exceeds the size limit")
+            limit = expected_size
+        constraints = Constraints(
+            max_size=limit,
+            accept=_narrow(dest.accept, accept),
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+        )
         if ttl is not None and ttl <= timedelta(0):
             raise ValueError("ttl must be positive")
         if ttl is not None and ttl > self._retention:
@@ -264,6 +313,7 @@ class UploadGateway:
             expires_at=now + (self._ttl if ttl is None else ttl),
             retention_until=now + self._retention,
             constraints=constraints,
+            owner=owner,
         )
         await self._store.put(record)
         logger.info("issued %s for destination %s", record.id, dest.name)
@@ -286,28 +336,61 @@ class UploadGateway:
             "multipart": {"fileField": self._field},
             "expiresAt": _iso(record.expires_at),
         }
+        file: FileValue = {"uri": self.uri(record.id)}
+        if record.constraints.expected_size is not None:
+            file["size"] = record.constraints.expected_size
+        if record.constraints.expected_sha256 is not None:
+            file["digest"] = _digest(record.constraints.expected_sha256)
         return {
             "status": "awaiting_upload",
             "id": record.id,
-            "file": {"uri": self.uri(record.id)},
+            "file": file,
             "upload": upload,
         }
 
-    async def status(self, record_id: str) -> UploadStatus:
+    async def status(self, record_id: str, *, owner: str | None = None) -> UploadStatus:
+        """The state of a record. Pass ``owner`` whenever the question comes from a
+        user: a record bound to a different owner is then reported as unknown."""
         record = await self._store.get(record_id)
-        if record is None:
+        if record is None or not _visible(record, owner):
             return {"id": record_id, "status": "unknown"}
         return self.status_of(record)
 
     def status_of(self, record: Record) -> UploadStatus:
         status: UploadStatus = {"id": record.id, "status": record.status.value}
-        if record.status is Status.COMPLETED:
+        now = self._clock()
+        if record.status in (Status.COMPLETED, Status.CLAIMED):
             status["file"] = self.file_value(record)
         elif record.status is Status.FAILED and record.outcome and record.outcome.error:
             status["error"] = record.outcome.error
-        elif record.status is Status.ISSUED and record.expired(self._clock()):
+            if record.outcome.details:
+                status["details"] = dict(record.outcome.details)
+        elif record.status is Status.ISSUED and record.expired(now):
             status["status"] = "expired"
+        elif record.status is Status.REDEEMED and self._abandoned(record, now):
+            # The process streaming this upload went away without recording an end.
+            # Without this the record would read "redeemed" until it is swept.
+            status["status"] = "failed"
+            status["error"] = "abandoned"
         return status
+
+    def _abandoned(self, record: Record, now: datetime) -> bool:
+        if self._upload_timeout is None or record.redeemed_at is None:
+            return False
+        limit = timedelta(seconds=self._upload_timeout) + _ABANDON_GRACE
+        return now > record.redeemed_at + limit
+
+    async def claim(self, record_id: str, *, owner: str | None = None) -> FileValue:
+        """Take a completed upload for use, once. The first claim wins and every later
+        one raises ``ClaimRefused``, so two tool calls naming the same file cannot both
+        act on it. A record bound to another owner is refused as unknown."""
+        record = await self._store.get(record_id)
+        if record is None or not _visible(record, owner):
+            raise ClaimRefused(ClaimError.NOT_FOUND)
+        claimed = await self._store.claim(record_id, self._clock())
+        if isinstance(claimed, ClaimError):
+            raise ClaimRefused(claimed)
+        return self.file_value(claimed)
 
     def file_value(self, record: Record) -> FileValue:
         value: FileValue = {"uri": self.uri(record.id)}
@@ -320,7 +403,7 @@ class UploadGateway:
             value["mimeType"] = outcome.media_type
         value["size"] = outcome.size
         if outcome.sha256:
-            value["digest"] = {"algorithm": "sha-256", "value": outcome.sha256}
+            value["digest"] = _digest(outcome.sha256)
         return value
 
     async def aclose(self) -> None:
@@ -400,7 +483,9 @@ class UploadGateway:
         limit = record.constraints.max_size
         declared = request.headers.get("content-length")
         if limit is not None and declared and declared.isdigit() and int(declared) > limit + 65536:
-            return self._error_response(request, record, "too_large")
+            return self._error_response(
+                request, record, "too_large", {"reason": "maxSizeExceeded", "maxSize": limit}
+            )
 
         try:
             dest = self._registry.get(record.destination)
@@ -421,7 +506,8 @@ class UploadGateway:
         if status is Status.COMPLETED:
             logger.info("completed %s: %d bytes to %s", final.id, outcome.size, dest.name)
             return self._success_response(request, final)
-        return self._error_response(request, final, outcome.error or "internal")
+        details = dict(outcome.details) if outcome.details else None
+        return self._error_response(request, final, outcome.error or "internal", details)
 
     # ----- streaming ---------------------------------------------------------------
 
@@ -513,6 +599,7 @@ class UploadGateway:
                 media_type=target.media_type,
                 error=exc.code,
                 upstream_status=exc.upstream_status,
+                details=exc.details,
             )
         finally:
             watchdog.cancel()
@@ -531,16 +618,24 @@ class UploadGateway:
                 ("id", record.id),
                 ("name", str(file.get("name", ""))),
                 ("size", str(file.get("size", 0))),
-                ("sha-256", str(file.get("digest", {}).get("value", ""))),
+                ("sha-256 (base64url)", str(file.get("digest", {}).get("value", ""))),
             ]
             return _html(page.result("Upload complete", rows), 200)
         return _json(dict(status), 200)
 
-    def _error_response(self, request: Request, record: Record | None, code: str) -> Response:
+    def _error_response(
+        self,
+        request: Request,
+        record: Record | None,
+        code: str,
+        details: dict[str, Any] | None = None,
+    ) -> Response:
         http_status = ERROR_STATUS.get(code, 500)
         body: dict[str, Any] = {"status": "failed", "error": code}
         if record is not None:
             body["id"] = record.id
+        if details:
+            body["details"] = details
         logger.warning("refused %s: %s", record.id if record else "-", code)
         headers = {"Retry-After": "5"} if code == "too_many_uploads" else None
         if _wants_html(request):
@@ -616,7 +711,15 @@ class _FileTarget(BaseTarget):
             # all. It is about to become a header on the backend request.
             raise UploadError("invalid_media_type", "declared media type is not a valid token")
         if not self._constraints.allows(media_type):
-            raise UploadError("unsupported_media_type", media_type)
+            raise UploadError(
+                "unsupported_media_type",
+                media_type,
+                details={
+                    "reason": "mimeTypeNotAccepted",
+                    "mimeType": media_type,
+                    "accept": list(self._constraints.accept),
+                },
+            )
         self.filename = sanitize_filename(self.multipart_filename)
         self.media_type = media_type
         self._state.started.set()
@@ -624,13 +727,53 @@ class _FileTarget(BaseTarget):
     async def on_data_received_async(self, chunk: bytes) -> None:
         self._announce()
         self.size += len(chunk)
+        expected = self._constraints.expected_size
+        if expected is not None and self.size > expected:
+            # More bytes than the uploader declared. Named for what went wrong rather
+            # than as too_large, since the declared size is also the size limit.
+            raise UploadError(
+                "size_mismatch",
+                details={
+                    "reason": "sizeMismatch",
+                    "expectedSize": expected,
+                    "receivedSize": self.size,
+                },
+            )
         limit = self._constraints.max_size
         if limit is not None and self.size > limit:
             # Enforced here and not on Content-Length, because a chunked upload has no
             # Content-Length and a lying one is trivial to send.
-            raise UploadError("too_large", f"more than {limit} bytes")
+            raise UploadError(
+                "too_large",
+                f"more than {limit} bytes",
+                details={"reason": "maxSizeExceeded", "maxSize": limit, "receivedSize": self.size},
+            )
         self.hasher.update(chunk)
         await self._queue.put(bytes(chunk))
+
+    def verify(self) -> None:
+        """Check the complete file against what the uploader declared, if anything."""
+        expected_size = self._constraints.expected_size
+        if expected_size is not None and self.size != expected_size:
+            raise UploadError(
+                "size_mismatch",
+                details={
+                    "reason": "sizeMismatch",
+                    "expectedSize": expected_size,
+                    "actualSize": self.size,
+                },
+            )
+        expected = self._constraints.expected_sha256
+        actual = self.hasher.hexdigest()
+        if expected is not None and actual != expected:
+            raise UploadError(
+                "digest_mismatch",
+                details={
+                    "reason": "digestMismatch",
+                    "expected": dict(_digest(expected)),
+                    "actual": dict(_digest(actual)),
+                },
+            )
 
     async def on_finish_async(self) -> None:
         # Only mark the part complete. The end-of-body signal is sent by the pump once
@@ -744,6 +887,9 @@ async def _pump(
             raise UploadError("missing_file", "no file part in the body")
         if not target.done:
             raise UploadError("truncated", "body ended before the file part was closed")
+        # The end of the upstream body has not been sent yet, so a mismatch here
+        # leaves the backend with an incomplete request rather than a committed file.
+        target.verify()
         await queue.put(_DONE)
     except UploadError as exc:
         state.error = exc
@@ -812,6 +958,30 @@ def _upstream(
 # ----- small helpers -------------------------------------------------------------------
 
 
+# How long past upload_timeout a redeemed record may sit before it is reported as
+# abandoned. The watchdog ends a live upload at upload_timeout, so a record still
+# redeemed after this belongs to a process that died.
+_ABANDON_GRACE = timedelta(seconds=30)
+
+
+def _digest(hex_digest: str) -> FileDigest:
+    return {"algorithm": "sha-256", "value": b64url(hex_digest)}
+
+
+def _expected_sha256(digest: FileDigest | str | None) -> str | None:
+    if digest is None:
+        return None
+    if isinstance(digest, str):
+        return sha256_hex(digest)
+    if digest.get("algorithm", "").lower() != "sha-256":
+        raise ValueError("only sha-256 digests are supported")
+    return sha256_hex(digest["value"])
+
+
+def _visible(record: Record, owner: str | None) -> bool:
+    return owner is None or record.owner is None or record.owner == owner
+
+
 async def _drain(receive: Any, limit: int = 1 << 20, timeout: float = 2.0) -> None:
     """Read and discard up to ``limit`` body bytes or ``timeout`` seconds, whichever
     ends first."""
@@ -876,4 +1046,4 @@ def _iso(when: datetime) -> str:
     return when.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-__all__ = ["ERROR_STATUS", "Issued", "StoreFull", "UploadError", "UploadGateway"]
+__all__ = ["ERROR_STATUS", "ClaimRefused", "Issued", "StoreFull", "UploadError", "UploadGateway"]

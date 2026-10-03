@@ -45,6 +45,7 @@ async def ask_for_upload(
     *,
     message: str = DEFAULT_MESSAGE,
     caller: str | None = None,
+    owner: str | None = None,
     ttl: timedelta | None = None,
     max_size: int | None = None,
     accept: tuple[str, ...] | None = None,
@@ -72,7 +73,7 @@ async def ask_for_upload(
     state = ctx.request_state
     if not isinstance(state, str) or not state.startswith("up_"):
         issued = await gateway.issue(
-            destination, caller=caller, ttl=ttl, max_size=max_size, accept=accept
+            destination, caller=caller, owner=owner, ttl=ttl, max_size=max_size, accept=accept
         )
         params = ElicitRequestURLParams(
             mode="url",
@@ -85,7 +86,7 @@ async def ask_for_upload(
             request_state=issued.record.id,
         )
 
-    status = await gateway.status(state)
+    status = await gateway.status(state, owner=owner)
     answer = (ctx.input_responses or {}).get(INPUT_KEY)
     action = getattr(answer, "action", None)
     if status["status"] == "issued" and action in ("decline", "cancel"):

@@ -18,9 +18,19 @@ import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
 from os import PathLike
-from typing import Any, Protocol
+from typing import Protocol
 
-from .tickets import Constraints, Outcome, Record, RedeemError, Status
+from .tickets import (
+    ClaimError,
+    Outcome,
+    Record,
+    RedeemError,
+    Status,
+    dump_constraints,
+    dump_outcome,
+    load_constraints,
+    load_outcome,
+)
 
 
 class StoreFull(Exception):
@@ -41,6 +51,8 @@ class Store(Protocol):
     async def finish(
         self, record_id: str, status: Status, outcome: Outcome, now: datetime
     ) -> Record | None: ...
+
+    async def claim(self, record_id: str, now: datetime) -> Record | ClaimError: ...
 
     async def sweep(self, now: datetime) -> int: ...
 
@@ -100,6 +112,19 @@ class MemoryStore:
         self._by_id[record_id] = record
         return record
 
+    async def claim(self, record_id: str, now: datetime) -> Record | ClaimError:
+        # The same rule as redeem: no await between the check and the write.
+        record = self._by_id.get(record_id)
+        if record is None:
+            return ClaimError.NOT_FOUND
+        if record.status is Status.CLAIMED:
+            return ClaimError.ALREADY_CLAIMED
+        if record.status is not Status.COMPLETED:
+            return ClaimError.NOT_COMPLETED
+        record = record.claimed(now)
+        self._by_id[record_id] = record
+        return record
+
     async def sweep(self, now: datetime) -> int:
         return self._sweep(now)
 
@@ -124,10 +149,16 @@ CREATE TABLE IF NOT EXISTS tickets (
     status          TEXT NOT NULL,
     redeemed_at     REAL,
     finished_at     REAL,
-    outcome         TEXT
+    outcome         TEXT,
+    owner           TEXT,
+    claimed_at      REAL
 );
 CREATE INDEX IF NOT EXISTS tickets_retention ON tickets (retention_until);
 """
+
+# Columns added after the first release. A database created by an older version gets
+# them on open, so upgrading never needs a manual migration.
+_ADDED_COLUMNS = {"owner": "TEXT", "claimed_at": "REAL"}
 
 _SELECT_BY = {
     "id": "SELECT * FROM tickets WHERE id = ?",
@@ -161,6 +192,10 @@ class SqliteStore:
         self._max = max_records
         with closing(self._connect()) as conn:
             conn.executescript(_SCHEMA)
+            present = {row["name"] for row in conn.execute("PRAGMA table_info(tickets)")}
+            for column, kind in _ADDED_COLUMNS.items():
+                if column not in present:
+                    conn.execute(f"ALTER TABLE tickets ADD COLUMN {column} {kind}")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._path, timeout=self._timeout, isolation_level=None)
@@ -185,7 +220,10 @@ class SqliteStore:
                     if count >= self._max:
                         raise StoreFull(f"sqlite store holds {self._max} records")
             conn.execute(
-                "INSERT INTO tickets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO tickets (id, ticket_hash, destination, caller, issued_at,"
+                " expires_at, retention_until, constraints, status, redeemed_at,"
+                " finished_at, outcome, owner, claimed_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.id,
                     record.ticket_hash,
@@ -194,10 +232,12 @@ class SqliteStore:
                     record.issued_at.timestamp(),
                     record.expires_at.timestamp(),
                     record.retention_until.timestamp(),
-                    _dump_constraints(record.constraints),
+                    json.dumps(dump_constraints(record.constraints)),
                     record.status.value,
                     None,
                     None,
+                    None,
+                    record.owner,
                     None,
                 ),
             )
@@ -250,10 +290,28 @@ class SqliteStore:
         with closing(self._connect()) as conn:
             conn.execute(
                 "UPDATE tickets SET status = ?, outcome = ?, finished_at = ? WHERE id = ?",
-                (status.value, _dump_outcome(outcome), now.timestamp(), record_id),
+                (status.value, json.dumps(dump_outcome(outcome)), now.timestamp(), record_id),
             )
             row = conn.execute("SELECT * FROM tickets WHERE id = ?", (record_id,)).fetchone()
         return None if row is None else _row_to_record(row)
+
+    async def claim(self, record_id: str, now: datetime) -> Record | ClaimError:
+        return await asyncio.to_thread(self._claim, record_id, now)
+
+    def _claim(self, record_id: str, now: datetime) -> Record | ClaimError:
+        with closing(self._connect()) as conn:
+            cur = conn.execute(
+                "UPDATE tickets SET status = ?, claimed_at = ? WHERE id = ? AND status = ?",
+                (Status.CLAIMED.value, now.timestamp(), record_id, Status.COMPLETED.value),
+            )
+            row = conn.execute("SELECT * FROM tickets WHERE id = ?", (record_id,)).fetchone()
+        if row is None:
+            return ClaimError.NOT_FOUND
+        if cur.rowcount == 1:
+            return _row_to_record(row)
+        if row["status"] == Status.CLAIMED.value:
+            return ClaimError.ALREADY_CLAIMED
+        return ClaimError.NOT_COMPLETED
 
     async def sweep(self, now: datetime) -> int:
         return await asyncio.to_thread(self._sweep, now)
@@ -262,35 +320,6 @@ class SqliteStore:
         with closing(self._connect()) as conn:
             cur = conn.execute("DELETE FROM tickets WHERE retention_until <= ?", (now.timestamp(),))
             return int(cur.rowcount)
-
-
-def _dump_constraints(c: Constraints) -> str:
-    return json.dumps({"max_size": c.max_size, "accept": list(c.accept)})
-
-
-def _load_constraints(text: str) -> Constraints:
-    data: dict[str, Any] = json.loads(text)
-    return Constraints(max_size=data.get("max_size"), accept=tuple(data.get("accept") or ()))
-
-
-def _dump_outcome(o: Outcome) -> str:
-    return json.dumps(
-        {
-            "size": o.size,
-            "filename": o.filename,
-            "media_type": o.media_type,
-            "sha256": o.sha256,
-            "error": o.error,
-            "upstream_status": o.upstream_status,
-        }
-    )
-
-
-def _load_outcome(text: str | None) -> Outcome | None:
-    if text is None:
-        return None
-    data: dict[str, Any] = json.loads(text)
-    return Outcome(**data)
 
 
 def _ts(value: float | None) -> datetime | None:
@@ -306,9 +335,11 @@ def _row_to_record(row: sqlite3.Row) -> Record:
         issued_at=datetime.fromtimestamp(row["issued_at"], UTC),
         expires_at=datetime.fromtimestamp(row["expires_at"], UTC),
         retention_until=datetime.fromtimestamp(row["retention_until"], UTC),
-        constraints=_load_constraints(row["constraints"]),
+        constraints=load_constraints(json.loads(row["constraints"])),
         status=Status(row["status"]),
         redeemed_at=_ts(row["redeemed_at"]),
         finished_at=_ts(row["finished_at"]),
-        outcome=_load_outcome(row["outcome"]),
+        outcome=None if row["outcome"] is None else load_outcome(json.loads(row["outcome"])),
+        owner=row["owner"],
+        claimed_at=_ts(row["claimed_at"]),
     )

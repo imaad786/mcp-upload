@@ -193,8 +193,48 @@ or open that URL in a browser. The response, and later `check_upload`, report:
     "name": "report.pdf",
     "mimeType": "application/pdf",
     "size": 5000000,
-    "digest": { "algorithm": "sha-256", "value": "5d3cb542..." }
+    "digest": { "algorithm": "sha-256", "value": "XTy1QnS2..." }
   }
+}
+```
+
+The digest value is base64url without padding, as SEP-2631 specifies.
+
+### Owners, declared digests and claiming
+
+Three options on `issue` close gaps a multi-user server has:
+
+```python
+issued = await gateway.issue(
+    "reports",
+    owner=user_id,  # status and claim answer only this owner
+    expected_size=248123,  # declared by the uploader, if known
+    expected_digest="uU0nuZNNPgilLlLX2n2r-sSE7-N6U4D6ZVe-_rYh2sU",
+)
+...
+status = await gateway.status(record_id, owner=user_id)
+file = await gateway.claim(record_id, owner=user_id)  # once; later claims raise
+```
+
+- **`owner`** binds the record to whoever asked for it. Record ids appear in
+  transcripts, so without it anyone who sees an id can read the file's name, size and
+  digest. With it, `status` and `claim` report another owner's record as unknown.
+- **`expected_size` and `expected_digest`** are what SEP-2631's `files/authorizeUpload`
+  carries. Bytes that do not match are refused with `size_mismatch` or
+  `digest_mismatch`, and the backend never sees the end of the body, so a backend that
+  commits only complete bodies never stores them.
+- **`claim`** takes a completed upload for use exactly once, atomically in every
+  store. Two tool calls naming the same file cannot both act on it. Status becomes
+  `claimed`. Claiming is optional; `status` works either way.
+
+A failed upload carries machine-readable `details` next to its error code, in the
+shape SEP-2631 suggests:
+
+```json
+{
+  "status": "failed",
+  "error": "too_large",
+  "details": { "reason": "maxSizeExceeded", "maxSize": 10485760, "receivedSize": 10485761 }
 }
 ```
 
@@ -289,7 +329,8 @@ expire in fifteen minutes and work once.
 Redemption flips a status field instead of deleting the record. Deleting is just as
 atomic, and it is what the obvious Redis `GETDEL` gives you, but it destroys the only
 place the outcome could live. A record here moves `issued` to `redeemed` to
-`completed` or `failed`, and stays until its retention deadline (24 hours by default)
+`completed` or `failed`, optionally `completed` to `claimed`, and stays until its
+retention deadline (24 hours by default)
 so "did that upload finish?" has an answer. Redemption stops being allowed at
 `expires_at` (15 minutes by default). The two clocks are independent.
 
@@ -354,6 +395,7 @@ ticket, so a stray or hostile non-multipart POST cannot burn someone's pending u
 | `unknown_ticket` | 404 | |
 | `ticket_used`, `ticket_expired` | 410 | |
 | `too_large` | 413 | On declared length or on the running count |
+| `size_mismatch`, `digest_mismatch` | 422 | Bytes differ from the size or digest declared at issue. Not committed. |
 | `part_headers_too_large` | 400 | More than 512 KiB of the body is not file data |
 | `too_slow`, `upload_timeout` | 408 | Client stalled (under 64 KiB in 30 s of waiting), or the upload ran past an hour |
 | `too_many_uploads` | 503 | `max_in_flight` reached, ticket untouched, `Retry-After` set |
@@ -361,6 +403,7 @@ ticket, so a stray or hostile non-multipart POST cannot burn someone's pending u
 | `invalid_media_type` | 400 | Declared type is not a valid `type/subtype` token |
 | `unsupported_media_type` | 415 | Declared type not in the accept list |
 | `client_disconnected` | 400 | Recorded on the record. No response reaches the client. |
+| `abandoned` | (status only) | The process streaming the upload died. Reported once `upload_timeout` plus 30 s has passed. |
 | `upstream_unreachable`, `upstream_rejected`, `upstream_closed_early` | 502 | Backend failure, mapped, never echoed |
 
 ## Streaming

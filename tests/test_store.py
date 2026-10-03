@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from mcp_upload import (
+    ClaimError,
     Constraints,
     MemoryStore,
     Outcome,
@@ -99,6 +100,34 @@ async def test_record_survives_redemption_and_reaches_a_terminal_state(store: St
     again = await store.get(record.id)
     assert again == done
     assert await store.get_by_hash(record.ticket_hash) == done
+
+
+async def test_fifty_concurrent_claims_have_one_winner(store: Store) -> None:
+    record = make_record(owner="alice", constraints=Constraints(max_size=10, expected_size=7))
+    await store.put(record)
+    assert await store.claim(record.id, NOW) is ClaimError.NOT_COMPLETED
+    await store.redeem(record.ticket_hash, NOW)
+    outcome = Outcome(size=7, sha256="ab", details={"note": "kept"})
+    await store.finish(record.id, Status.COMPLETED, outcome, NOW)
+
+    results = await asyncio.gather(*(store.claim(record.id, NOW) for _ in range(50)))
+    winners = [r for r in results if isinstance(r, Record)]
+    assert len(winners) == 1
+    assert winners[0].status is Status.CLAIMED
+    assert winners[0].owner == "alice"
+    assert winners[0].constraints.expected_size == 7
+    assert winners[0].outcome is not None and winners[0].outcome.details == {"note": "kept"}
+    assert all(r is ClaimError.ALREADY_CLAIMED for r in results if not isinstance(r, Record))
+    assert await store.claim("up_missing", NOW) is ClaimError.NOT_FOUND
+
+
+async def test_finish_does_not_resurrect_a_swept_record(store: Store) -> None:
+    record = make_record()
+    await store.put(record)
+    await store.redeem(record.ticket_hash, NOW)
+    await store.sweep(NOW + timedelta(days=2))
+    assert await store.finish(record.id, Status.COMPLETED, Outcome(size=1), NOW) is None
+    assert await store.get(record.id) is None
 
 
 async def test_expired_ticket_is_refused_and_distinguished(store: Store) -> None:

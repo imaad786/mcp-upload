@@ -41,7 +41,17 @@ from redis.asyncio import Redis
 from redis.commands.core import AsyncScript
 from redis.typing import EncodableT
 
-from .tickets import Constraints, Outcome, Record, RedeemError, Status
+from .tickets import (
+    ClaimError,
+    Outcome,
+    Record,
+    RedeemError,
+    Status,
+    dump_constraints,
+    dump_outcome,
+    load_constraints,
+    load_outcome,
+)
 
 # KEYS[1] is the record hash. ARGV is (issued status, now, redeemed status).
 # Returns the flat hash on success, or a bare error string.
@@ -60,6 +70,39 @@ end
 redis.call('HSET', KEYS[1], 'status', ARGV[3], 'redeemed_at', ARGV[2])
 return redis.call('HGETALL', KEYS[1])
 """
+
+# KEYS[1] is the record hash. ARGV is (status, outcome json, finished_at). Writing to a
+# key that has already expired would recreate it as a hash with no TTL that is never
+# reaped, so the existence check and the write happen in one step.
+_FINISH_LUA = """
+if redis.call('EXISTS', KEYS[1]) == 0 then
+    return 0
+end
+redis.call('HSET', KEYS[1], 'status', ARGV[1], 'outcome', ARGV[2], 'finished_at', ARGV[3])
+return 1
+"""
+
+# KEYS[1] is the record hash. ARGV is (completed status, claimed status, now).
+_CLAIM_LUA = """
+local status = redis.call('HGET', KEYS[1], 'status')
+if not status then
+    return 'not_found'
+end
+if status == ARGV[2] then
+    return 'already_claimed'
+end
+if status ~= ARGV[1] then
+    return 'not_completed'
+end
+redis.call('HSET', KEYS[1], 'status', ARGV[2], 'claimed_at', ARGV[3])
+return redis.call('HGETALL', KEYS[1])
+"""
+
+_CLAIM_ERRORS = {
+    "not_found": ClaimError.NOT_FOUND,
+    "already_claimed": ClaimError.ALREADY_CLAIMED,
+    "not_completed": ClaimError.NOT_COMPLETED,
+}
 
 _ERRORS = {
     "not_found": RedeemError.NOT_FOUND,
@@ -85,6 +128,8 @@ class RedisStore:
         self._redis = client
         self._prefix = prefix
         self._redeem: AsyncScript = client.register_script(_REDEEM_LUA)
+        self._finish: AsyncScript = client.register_script(_FINISH_LUA)
+        self._claim: AsyncScript = client.register_script(_CLAIM_LUA)
 
     def _record_key(self, record_id: str) -> str:
         return f"{self._prefix}:rec:{record_id}"
@@ -134,18 +179,20 @@ class RedisStore:
     async def finish(
         self, record_id: str, status: Status, outcome: Outcome, now: datetime
     ) -> Record | None:
-        record_key = self._record_key(record_id)
-        if not await self._redis.exists(record_key):
-            return None
-        await self._redis.hset(
-            record_key,
-            mapping={
-                "status": status.value,
-                "outcome": _dump_outcome(outcome),
-                "finished_at": repr(now.timestamp()),
-            },
+        written = await self._finish(
+            keys=[self._record_key(record_id)],
+            args=[status.value, json.dumps(dump_outcome(outcome)), repr(now.timestamp())],
         )
-        return await self.get(record_id)
+        return await self.get(record_id) if written else None
+
+    async def claim(self, record_id: str, now: datetime) -> Record | ClaimError:
+        result = await self._claim(
+            keys=[self._record_key(record_id)],
+            args=[Status.COMPLETED.value, Status.CLAIMED.value, repr(now.timestamp())],
+        )
+        if isinstance(result, (bytes, str)):
+            return _CLAIM_ERRORS.get(_text(result), ClaimError.NOT_FOUND)
+        return _from_fields(_decode_mapping(_pairs_to_mapping(result)))
 
     async def sweep(self, now: datetime) -> int:
         """Delete records past their retention deadline and return how many went.
@@ -183,13 +230,13 @@ def _to_fields(record: Record) -> dict[EncodableT, EncodableT]:
         "issued_at": repr(record.issued_at.timestamp()),
         "expires_at": repr(record.expires_at.timestamp()),
         "retention_until": repr(record.retention_until.timestamp()),
-        "constraints": json.dumps(
-            {"max_size": record.constraints.max_size, "accept": list(record.constraints.accept)}
-        ),
+        "constraints": json.dumps(dump_constraints(record.constraints)),
         "status": record.status.value,
     }
     if record.caller is not None:
         fields["caller"] = record.caller
+    if record.owner is not None:
+        fields["owner"] = record.owner
     return fields
 
 
@@ -202,11 +249,13 @@ def _from_fields(f: dict[str, str]) -> Record:
         issued_at=_time(f["issued_at"]),
         expires_at=_time(f["expires_at"]),
         retention_until=_time(f["retention_until"]),
-        constraints=_load_constraints(f["constraints"]),
+        constraints=load_constraints(json.loads(f["constraints"])),
         status=Status(f["status"]),
         redeemed_at=_maybe_time(f.get("redeemed_at")),
         finished_at=_maybe_time(f.get("finished_at")),
-        outcome=_load_outcome(f.get("outcome")),
+        outcome=None if f.get("outcome") is None else load_outcome(json.loads(f["outcome"])),
+        owner=f.get("owner"),
+        claimed_at=_maybe_time(f.get("claimed_at")),
     )
 
 
@@ -229,28 +278,3 @@ def _decode_mapping(mapping: dict[Any, Any]) -> dict[str, str]:
 def _pairs_to_mapping(flat: list[Any]) -> dict[Any, Any]:
     # HGETALL through a Lua script comes back as a flat array, not a map.
     return dict(zip(flat[::2], flat[1::2], strict=True))
-
-
-def _load_constraints(text: str) -> Constraints:
-    data: dict[str, Any] = json.loads(text)
-    return Constraints(max_size=data.get("max_size"), accept=tuple(data.get("accept") or ()))
-
-
-def _dump_outcome(o: Outcome) -> str:
-    return json.dumps(
-        {
-            "size": o.size,
-            "filename": o.filename,
-            "media_type": o.media_type,
-            "sha256": o.sha256,
-            "error": o.error,
-            "upstream_status": o.upstream_status,
-        }
-    )
-
-
-def _load_outcome(text: str | None) -> Outcome | None:
-    if text is None:
-        return None
-    data: dict[str, Any] = json.loads(text)
-    return Outcome(**data)

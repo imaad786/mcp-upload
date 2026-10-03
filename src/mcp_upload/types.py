@@ -13,7 +13,7 @@ tool output schema from them on its own.
 from __future__ import annotations
 
 import sys
-from typing import Literal, NotRequired
+from typing import Any, Literal, NotRequired
 
 # The MCP SDK builds tool output schemas with pydantic, which only understands the
 # typing_extensions TypedDict on Python 3.11. On 3.11 the standard library one is
@@ -26,6 +26,8 @@ else:
 
 
 class FileDigest(TypedDict):
+    """``value`` is base64url without padding, as SEP-2631 specifies."""
+
     algorithm: str
     value: str
 
@@ -63,10 +65,13 @@ class AwaitingUpload(TypedDict):
 
 class UploadStatus(TypedDict):
     """What a status lookup returns. ``status`` is one of issued, redeemed, completed,
-    failed, expired or unknown, plus declined or cancelled when the user was asked
-    through elicitation and refused. ``file`` is present once the upload completed."""
+    claimed, failed, expired or unknown, plus declined or cancelled when the user was
+    asked through elicitation and refused. ``file`` is present once the upload
+    completed. ``error`` names a failure, and ``details`` carries machine-readable
+    specifics such as ``{"reason": "maxSizeExceeded", "maxSize": 1000}``."""
 
     id: str
     status: str
     file: NotRequired[FileValue]
     error: NotRequired[str]
+    details: NotRequired[dict[str, Any]]

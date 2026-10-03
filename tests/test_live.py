@@ -28,6 +28,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from mcp_upload import Destination, MemoryStore, Registry, UploadGateway
+from mcp_upload.tickets import b64url
 
 CHUNK = 64 * 1024
 
@@ -193,7 +194,7 @@ async def test_memory_stays_flat_under_a_slow_backend(stack: Stack) -> None:
     assert response.status_code == 200, response.text
     reported = response.json()["file"]
     assert reported["size"] == size
-    assert reported["digest"]["value"] == digest.hexdigest()
+    assert reported["digest"]["value"] == b64url(digest.hexdigest())
     assert stack.backend.received == [
         {"name": "big.bin", "size": size, "sha256": digest.hexdigest()}
     ]

@@ -15,12 +15,16 @@ exact comparison rejects a valid ``MULTIPART/FORM-DATA``.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping
 from pathlib import PurePosixPath
 
 MULTIPART_FORM_DATA = "multipart/form-data"
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+# Unicode categories that render as nothing or rearrange text: controls, format
+# characters (bidi overrides, zero-width joiners), and line and paragraph separators.
+_INVISIBLE = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
 
 def parse_content_type(value: str | None) -> tuple[str, dict[str, str]]:
@@ -130,13 +134,30 @@ def sanitize_filename(name: str | None, default: str = "upload") -> str:
     The multipart parser hands the filename through untouched, so ``../../etc/passwd``
     arrives exactly like that. Since the name is forwarded to the backend, which may
     well write it to disk, both separator conventions are collapsed and only the last
-    component survives. Control characters are dropped. An empty or dot-only result
-    falls back to the default.
+    component survives. The name is normalized to NFC so one name has one spelling.
+    Control characters are dropped, and so are invisible format characters, which
+    include the bidirectional overrides that make ``invoice\u202egpj.exe`` display
+    as ``invoiceexe.jpg``. The result is cut to 255 bytes of UTF-8, the usual
+    filesystem limit, on a character boundary. An empty or dot-only result falls back
+    to the default.
     """
     if not name:
         return default
-    base = PurePosixPath(name.replace("\\", "/")).name
+    base = unicodedata.normalize("NFC", name)
+    base = "".join(ch for ch in base if unicodedata.category(ch) not in _INVISIBLE)
+    base = PurePosixPath(base.replace("\\", "/")).name
     base = _CONTROL_CHARS.sub("", base).strip()
     if base in ("", ".", ".."):
         return default
-    return base[:255]
+    return _fit(base, 255)
+
+
+def _fit(name: str, limit: int) -> str:
+    """Cut ``name`` to ``limit`` bytes of UTF-8 on a character boundary, keeping a
+    short extension so the backend still sees what kind of file it is."""
+    if len(name.encode("utf-8")) <= limit:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    suffix = (dot + ext).encode("utf-8") if stem and len(ext.encode("utf-8")) <= 16 else b""
+    head = (stem if suffix else name).encode("utf-8")[: limit - len(suffix)]
+    return head.decode("utf-8", "ignore") + suffix.decode("utf-8")

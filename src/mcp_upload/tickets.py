@@ -17,11 +17,15 @@ after issue. Expiry is derived from the clock at read time, never stored as a st
 
 from __future__ import annotations
 
+import base64
+import binascii
 import enum
 import hashlib
 import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from typing import Any
 
 
 class Status(enum.StrEnum):
@@ -29,6 +33,7 @@ class Status(enum.StrEnum):
     REDEEMED = "redeemed"
     COMPLETED = "completed"
     FAILED = "failed"
+    CLAIMED = "claimed"
 
 
 class RedeemError(enum.StrEnum):
@@ -40,6 +45,14 @@ class RedeemError(enum.StrEnum):
     ALREADY_USED = "already_used"
 
 
+class ClaimError(enum.StrEnum):
+    """Why a claim did not happen."""
+
+    NOT_FOUND = "not_found"
+    NOT_COMPLETED = "not_completed"
+    ALREADY_CLAIMED = "already_claimed"
+
+
 @dataclass(frozen=True, slots=True)
 class Constraints:
     """What the upload must satisfy. Enforced on the bytes actually received, not on
@@ -47,6 +60,10 @@ class Constraints:
 
     max_size: int | None = None
     accept: tuple[str, ...] = ()
+    #: The exact size and SHA-256 (hex) the uploader declared in advance, if any. An
+    #: upload whose bytes do not match is refused before the backend can commit it.
+    expected_size: int | None = None
+    expected_sha256: str | None = None
 
     def allows(self, media_type: str | None) -> bool:
         """Match a declared media type against the accept list. Patterns are exact types
@@ -78,6 +95,10 @@ class Outcome:
     sha256: str | None = None
     error: str | None = None
     upstream_status: int | None = None
+    #: Machine-readable detail for a failure, such as ``{"reason": "maxSizeExceeded",
+    #: "maxSize": 1000}``. Built by the gateway from what it measured, never from
+    #: anything a backend said.
+    details: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +115,9 @@ class Record:
     redeemed_at: datetime | None = None
     finished_at: datetime | None = None
     outcome: Outcome | None = None
+    #: Who may see and claim the record. ``None`` means anyone the server lets ask.
+    owner: str | None = None
+    claimed_at: datetime | None = None
 
     def expired(self, now: datetime) -> bool:
         return now >= self.expires_at
@@ -103,6 +127,9 @@ class Record:
 
     def finished(self, status: Status, outcome: Outcome, now: datetime) -> Record:
         return replace(self, status=status, outcome=outcome, finished_at=now)
+
+    def claimed(self, now: datetime) -> Record:
+        return replace(self, status=Status.CLAIMED, claimed_at=now)
 
 
 def utcnow() -> datetime:
@@ -124,3 +151,55 @@ def new_id() -> str:
 
 def hash_secret(secret: str) -> str:
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def b64url(hex_digest: str) -> str:
+    """A hex digest as SEP-2631 writes it: base64url without padding."""
+    return base64.urlsafe_b64encode(bytes.fromhex(hex_digest)).rstrip(b"=").decode()
+
+
+def sha256_hex(value: str) -> str:
+    """A SHA-256 digest given as base64url (with or without padding) as hex. Raises
+    ``ValueError`` unless it decodes to exactly 32 bytes."""
+    try:
+        raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except (binascii.Error, ValueError):
+        raise ValueError("digest value is not base64url") from None
+    if len(raw) != 32:
+        raise ValueError("a sha-256 digest is 32 bytes")
+    return raw.hex()
+
+
+def dump_constraints(c: Constraints) -> dict[str, Any]:
+    return {
+        "max_size": c.max_size,
+        "accept": list(c.accept),
+        "expected_size": c.expected_size,
+        "expected_sha256": c.expected_sha256,
+    }
+
+
+def load_constraints(data: Mapping[str, Any]) -> Constraints:
+    return Constraints(
+        max_size=data.get("max_size"),
+        accept=tuple(data.get("accept") or ()),
+        expected_size=data.get("expected_size"),
+        expected_sha256=data.get("expected_sha256"),
+    )
+
+
+def dump_outcome(o: Outcome) -> dict[str, Any]:
+    return {
+        "size": o.size,
+        "filename": o.filename,
+        "media_type": o.media_type,
+        "sha256": o.sha256,
+        "error": o.error,
+        "upstream_status": o.upstream_status,
+        "details": dict(o.details) if o.details is not None else None,
+    }
+
+
+def load_outcome(data: Mapping[str, Any]) -> Outcome:
+    known = {k: data[k] for k in dump_outcome(Outcome()) if k in data}
+    return Outcome(**known)

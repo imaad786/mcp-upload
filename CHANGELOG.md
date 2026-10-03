@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.4.0 (2026-10-03)
+
+Conformance with SEP-2631's shapes, and the pieces a multi-user server needs. Measured
+against 0.3.1 with the end-to-end harness, which gained eight scenarios for this
+release. None of the existing scenarios regressed: one upload streams at 858 MiB/s
+against 878, and 200 concurrent ones at 740 against 747, within run-to-run noise.
+
+**Breaking**
+
+- **Digests are base64url.** `FileValue.digest.value` was hex. SEP-2631 specifies
+  base64url without padding, and a client following it saw a mismatch.
+- **`Store` gained `claim`.** A custom store must implement it.
+
+**Added**
+
+- **Declared size and digest.** `issue(expected_size=..., expected_digest=...)` takes
+  what `files/authorizeUpload` carries. Bytes that do not match are refused with
+  `size_mismatch` or `digest_mismatch` (422) before the backend sees the end of the
+  body. Live: 100 of 100 wrong digests and 50 of 50 wrong sizes refused, none
+  committed, and 100 of 100 matching uploads completed with the right bytes.
+- **Owners.** `issue(owner=...)` binds a record to a user, and `status` and `claim`
+  with a different owner report it as unknown. Live: 50 of 50 lookups by another user
+  saw nothing, and none of their claims won.
+- **`claim`.** Takes a completed upload for use exactly once, atomically in every
+  store. Live: 20 concurrent claims on each of 50 records produced exactly one winner
+  per record on the memory and SQLite stores, and 50 concurrent claims produced one
+  winner on a real Redis 8.
+- **Machine-readable `details`** on every failure that has them, in the response and
+  in status, for example `{"reason": "maxSizeExceeded", "maxSize": 1000}`.
+- **`abandoned`.** A record left `redeemed` by a process that died now reads as
+  `failed` with error `abandoned` once `upload_timeout` plus 30 seconds has passed.
+  Live: a gateway killed mid-upload left its record `redeemed` forever on 0.3.1, and
+  `abandoned` 33 seconds after restart on 0.4.0.
+
+**Fixed**
+
+- **Redis `finish` could recreate a swept record** as a key with no TTL. The check and
+  the write are now one Lua script.
+- **Filenames** are normalized to NFC, lose invisible format characters such as the
+  right-to-left override that made `invoice\u202egpj.exe` display as
+  `invoiceexe.jpg`, and are cut to 255 bytes of UTF-8, not 255 characters, keeping a
+  short extension.
+- **SQLite databases from earlier versions** gain the new columns on open. Live: a
+  0.3.1 database kept its completed record, and its unused ticket redeemed correctly.
+
 ## 0.3.1 (2026-10-03)
 
 Security, integrity and robustness fixes, each measured against 0.3.0 on the same

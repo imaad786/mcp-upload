@@ -16,18 +16,21 @@ reference ever travels through MCP.
 """
 
 from .destinations import Destination, Registry, UnknownDestination
-from .gateway import ERROR_STATUS, Issued, UploadError, UploadGateway
+from .gateway import ERROR_STATUS, ClaimRefused, Issued, UploadError, UploadGateway
 from .store import MemoryStore, SqliteStore, Store, StoreFull
-from .tickets import Constraints, Outcome, Record, RedeemError, Status
-from .types import AwaitingUpload, FileTransferDescriptor, FileValue, UploadStatus
+from .tickets import ClaimError, Constraints, Outcome, Record, RedeemError, Status
+from .types import AwaitingUpload, FileDigest, FileTransferDescriptor, FileValue, UploadStatus
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
     "ERROR_STATUS",
     "AwaitingUpload",
+    "ClaimError",
+    "ClaimRefused",
     "Constraints",
     "Destination",
+    "FileDigest",
     "FileTransferDescriptor",
     "FileValue",
     "Issued",
