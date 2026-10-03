@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.3.1 (2026-10-03)
+
+Security, integrity and robustness fixes, each measured against 0.3.0 on the same
+machine with the new end-to-end harness and framing fuzz in `stress/`. Upgrading is
+recommended.
+
+- **Uploads could complete with the wrong bytes.** When the text after the closing
+  delimiter repeated the delimiter, and for some binary epilogues, the extra bytes were
+  appended to the file sent to the backend while the upload reported success, with a
+  digest of the wrong bytes. In 3,000 randomized bodies, 398 completed this way on
+  0.3.0 and none on 0.3.1.
+- **Part headers are bounded.** The multipart parser buffers a part's headers whole, at
+  a cost that grows faster than their size, and `max_size` only counted file bytes. One
+  holder of a valid ticket could send a 64 MiB header with no `Content-Length` and take
+  the gateway past 4 GB of memory while the upload reported success. Non-file data in
+  the body is now capped at 512 KiB (`part_headers_too_large`).
+- **Slow clients are cut off.** A client sending a byte every few seconds held its slot
+  and a backend connection indefinitely, so 32 of them shut out every honest upload.
+  An upload is now refused with `too_slow` when it delivers under 64 KiB within 30
+  seconds of waiting on the client, and with `upload_timeout` after an hour. Time spent
+  waiting on a slow backend is not counted. See `stall_timeout`, `stall_min_bytes` and
+  `upload_timeout`.
+- **`max_in_flight` holds under bursts.** The slot was counted after the store lookup,
+  so a burst passed the check together: with a cap of 8, 100 uploads reached the
+  backend at once in an unpaced burst. The slot is now taken before the first await.
+  The default is now 100 instead of unlimited, and the default HTTP client is sized to
+  it. Before, the client's hidden pool of 100 queued uploads after their tickets were
+  spent: with a cap of 250, only 100 reached the backend at once, and now all 250 do.
+- **Preambles and epilogues are accepted.** RFC 2046 allows text before the first
+  delimiter and after the last. The parser rejected both, so an upload followed by a
+  single trailing CRLF failed as `truncated`: 100 of 100 such uploads failed on 0.3.0,
+  none on 0.3.1. The epilogue is now ignored, read to at most 64 KiB.
+- **Early refusals reach the client.** A refusal sent before the body was read closed
+  the socket with unread data, and the reset could destroy the response, so a client
+  saw "connection reset" instead of 503 or 413. Up to 1 MiB is now read after the
+  response is sent. In the slow-client run, honest uploads that ended in a connection
+  error instead of a status fell from 37 of 40 to 8 of 40. Bodies much larger than
+  1 MiB can still see a reset.
+- **Per-ticket `accept` cannot widen the destination's list.** It replaced the list, so
+  an `image/*` destination took a `.exe`. A type outside the destination's list now
+  raises `ValueError`, and an empty list means the destination's own.
+- **`ttl` is validated.** `ttl=timedelta(0)` silently became fifteen minutes, and a
+  `ttl` longer than the retention let a record vanish while still redeemable. Both now
+  raise `ValueError`, as do a negative `max_size` and nonsensical gateway settings.
+
+The cost, on loopback: one upload streams at 911 MiB/s against 1,000 before, and 200
+concurrent uploads at 760 MiB/s against 785. Most of it is the scan for the closing
+delimiter, which is what makes the epilogue handling correct. Peak memory with 200
+concurrent uploads is about 15% higher, because all 200 now stream at once where the
+old hidden pool let 100 through.
+
 ## 0.3.0 (2026-10-03)
 
 - **The `fastmcp` extra now requires FastMCP 4.x** (`fastmcp>=4,<5`). FastMCP 4.x builds

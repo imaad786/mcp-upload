@@ -208,7 +208,9 @@ async def test_unknown_ticket(client: httpx.AsyncClient) -> None:
 async def test_expired_ticket(
     client: httpx.AsyncClient, gateway: UploadGateway, upstream: Upstream
 ) -> None:
-    issued = await issue(gateway, ttl=timedelta(seconds=-1))
+    issued = await issue(gateway, ttl=timedelta(seconds=1))
+    later = issued.record.expires_at
+    gateway._clock = lambda: later  # the moment of expiry, which is already too late
     response = await post(client, issued.upload_url, [("file", "a.txt", b"x", None)])
     assert response.status_code == 410
     assert response.json()["error"] == "ticket_expired"

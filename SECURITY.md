@@ -39,6 +39,9 @@ and never lets a tool argument become a URL, host or path.
 - **Content.** The declared media type is checked against the accept list. The bytes
   are not inspected. If the backend must not receive certain content, the backend has
   to check.
+- **Resources.** Each process streams at most `max_in_flight` uploads at once, refuses
+  a body with more than 512 KiB that is not file data, and cuts off clients that stall
+  or run past `upload_timeout`. Limits across processes belong at your proxy.
 - **Logs.** The library logs record ids and outcome codes and never the ticket. Your
   access logs will contain the ticket URL. Scrub the path or accept that a leaked log
   yields tickets that expire in fifteen minutes and work once.

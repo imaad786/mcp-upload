@@ -35,6 +35,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from starlette.background import BackgroundTask
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
@@ -44,7 +45,7 @@ from streaming_form_data.targets import BaseTarget
 
 from . import page
 from .destinations import Destination, Registry, UnknownDestination
-from .multipart import multipart_error, sanitize_filename
+from .multipart import Framer, boundary_of, multipart_error, sanitize_filename
 from .store import Store, StoreFull
 from .tickets import (
     Constraints,
@@ -71,6 +72,21 @@ _TCHARS = r"[A-Za-z0-9!#$%&'*+.^_`|~-]+"
 _MEDIA_TYPE = re.compile(rf"^{_TCHARS}/{_TCHARS}$")
 _MAX_MEDIA_TYPE_LENGTH = 255
 
+# Bounds on everything in the body that is not file data. The multipart parser buffers
+# part headers whole, with cost that grows faster than their size: a 64 MiB header
+# drove one process past 4 GB while max_size was 1 MiB, because max_size only counts
+# file bytes. So the bytes handed to the parser beyond the file's own are capped, and
+# the preamble and epilogue that RFC 2046 allows are bounded separately. The parser is
+# fed at most one slice at a time so a single large read cannot slip past the check.
+# The slice is the largest read asyncio delivers, so a normal read is one call: smaller
+# slices multiplied the per-chunk cost of hashing, queueing and forwarding and took a
+# third off throughput. The overhead cap leaves room for the parser holding back part
+# of a slice while it looks for a delimiter.
+_MAX_OVERHEAD = 512 * 1024
+_FEED_SLICE = 256 * 1024
+_MAX_PREAMBLE = 16 * 1024
+_MAX_EPILOGUE = 64 * 1024
+
 # Every failure the endpoint can report, and the HTTP status it maps to. Backend error
 # text is never passed through; a backend failure becomes one of these codes.
 ERROR_STATUS: dict[str, int] = {
@@ -80,6 +96,9 @@ ERROR_STATUS: dict[str, int] = {
     "ticket_used": 410,
     "ticket_expired": 410,
     "too_large": 413,
+    "part_headers_too_large": 400,
+    "too_slow": 408,
+    "upload_timeout": 408,
     "too_many_uploads": 503,
     "missing_file": 400,
     "duplicate_file": 400,
@@ -136,7 +155,10 @@ class UploadGateway:
         retention: timedelta = timedelta(hours=24),
         http: httpx.AsyncClient | None = None,
         queue_size: int = 4,
-        max_in_flight: int | None = None,
+        max_in_flight: int | None = 100,
+        stall_timeout: timedelta | None = timedelta(seconds=30),
+        stall_min_bytes: int = 64 * 1024,
+        upload_timeout: timedelta | None = timedelta(hours=1),
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         """
@@ -150,12 +172,29 @@ class UploadGateway:
         ``queue_size`` is how many parsed chunks may sit between the parser and the
         backend request. Small on purpose: that bound is the backpressure.
 
-        ``max_in_flight`` caps how many uploads may be streaming at once. Each one
-        holds a parser, a queue and a connection to the backend, so without a cap a
-        flood of slow uploads exhausts the worker. Beyond the cap a request gets 503
-        before its ticket is touched, so it can be retried. Leave it ``None`` only when
-        something in front of the server enforces a limit.
+        ``max_in_flight`` caps how many uploads may be streaming at once in this
+        process. Each one holds a parser, a queue and a connection to the backend.
+        Beyond the cap a request gets 503 before its ticket is touched, so it can be
+        retried. The default HTTP client is sized to the same number, so the cap is the
+        only limit: a smaller hidden pool would queue uploads after their tickets were
+        spent. ``None`` removes the cap and the pool limit together. If you pass your own
+        ``http`` client, size its pool to at least ``max_in_flight``.
+
+        ``stall_timeout`` and ``stall_min_bytes`` refuse an upload that delivers fewer
+        than ``stall_min_bytes`` within ``stall_timeout`` of waiting on the client.
+        Only time spent waiting for the client counts, never time spent waiting on a
+        slow backend. Without this, a client sending a byte every few seconds holds a
+        slot and a backend connection indefinitely. ``upload_timeout`` bounds the
+        whole upload from redemption to the last byte. ``None`` disables either.
         """
+        if ttl <= timedelta(0):
+            raise ValueError("ttl must be positive")
+        if retention < ttl:
+            raise ValueError("retention must be at least ttl, or records vanish while redeemable")
+        if max_in_flight is not None and max_in_flight < 1:
+            raise ValueError("max_in_flight must be at least 1, or None for no cap")
+        if queue_size < 1:
+            raise ValueError("queue_size must be at least 1")
         self._base_url = base_url.rstrip("/")
         self._registry = registry
         self._store = store
@@ -164,11 +203,19 @@ class UploadGateway:
         self._field = field_name
         self._ttl = ttl
         self._retention = retention
-        self._http = http or httpx.AsyncClient()
+        self._http = http or httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=max_in_flight,
+                max_keepalive_connections=min(20, max_in_flight or 20),
+            )
+        )
         self._owns_http = http is None
         self._queue_size = queue_size
         self._max_in_flight = max_in_flight
         self._in_flight = 0
+        self._stall_timeout = None if stall_timeout is None else stall_timeout.total_seconds()
+        self._stall_min_bytes = stall_min_bytes
+        self._upload_timeout = None if upload_timeout is None else upload_timeout.total_seconds()
         self._clock = clock
         self._transport = urlsplit(self._base_url).scheme or "https"
 
@@ -191,14 +238,21 @@ class UploadGateway:
 
         Per-ticket limits can only tighten the destination's defaults. A tool that
         passes a larger ``max_size`` than the destination allows gets the destination's.
+        An ``accept`` list must stay inside the destination's: a type the destination
+        does not allow raises ``ValueError``, and an empty list means the destination's
+        own. ``ttl`` must be positive and no longer than the gateway's retention.
         """
         dest = self._registry.get(destination)
         limit = dest.max_size
         if max_size is not None:
+            if max_size < 0:
+                raise ValueError("max_size must not be negative")
             limit = max_size if limit is None else min(limit, max_size)
-        constraints = Constraints(
-            max_size=limit, accept=accept if accept is not None else dest.accept
-        )
+        constraints = Constraints(max_size=limit, accept=_narrow(dest.accept, accept))
+        if ttl is not None and ttl <= timedelta(0):
+            raise ValueError("ttl must be positive")
+        if ttl is not None and ttl > self._retention:
+            raise ValueError("ttl must not exceed the gateway's retention")
         now = self._clock()
         secret = new_secret()
         record = Record(
@@ -207,7 +261,7 @@ class UploadGateway:
             destination=dest.name,
             caller=caller,
             issued_at=now,
-            expires_at=now + (ttl or self._ttl),
+            expires_at=now + (self._ttl if ttl is None else ttl),
             retention_until=now + self._retention,
             constraints=constraints,
         )
@@ -282,7 +336,16 @@ class UploadGateway:
         secret = str(request.path_params["ticket"])
         if request.method == "GET":
             return await self._render_form(request, secret)
-        return await self._ingest(request, secret)
+        response = await self._ingest(request, secret)
+        meter = getattr(request.state, "mcp_upload_meter", None)
+        if meter is None or not meter.body_done:
+            # Refused before the body was read to its end. Closing a socket with unread
+            # data makes the kernel send a reset, which can destroy the response before
+            # the client reads it, so a 503 or 413 arrives as "connection reset" and the
+            # client cannot tell what happened. Reading a bounded amount after the
+            # response is sent gives the client time to see the answer and stop.
+            response.background = BackgroundTask(_drain, request.receive)
+        return response
 
     async def _render_form(self, request: Request, secret: str) -> Response:
         # Reading the record does not spend the ticket. The form is shown only while
@@ -310,9 +373,18 @@ class UploadGateway:
         code = multipart_error(request.headers)
         if code is not None:
             return self._error_response(request, None, code)
+        # The slot is taken before the first await. Checking here and counting later
+        # lets every request in a burst pass the check while the others are suspended
+        # in the store, which with a cap of 8 put 100 uploads on the backend at once.
         if self._max_in_flight is not None and self._in_flight >= self._max_in_flight:
             return self._error_response(request, None, "too_many_uploads")
+        self._in_flight += 1
+        try:
+            return await self._ingest_in_slot(request, secret)
+        finally:
+            self._in_flight -= 1
 
+    async def _ingest_in_slot(self, request: Request, secret: str) -> Response:
         ticket_hash = hash_secret(secret)
         now = self._clock()
         record = await self._store.get_by_hash(ticket_hash)
@@ -342,11 +414,7 @@ class UploadGateway:
             return self._error_response(request, record, code)
 
         # Steps 4 and 5.
-        self._in_flight += 1
-        try:
-            status, outcome = await self._forward(request, redeemed, dest)
-        finally:
-            self._in_flight -= 1
+        status, outcome = await self._forward(request, redeemed, dest)
         final = await self._store.finish(redeemed.id, status, outcome, self._clock())
         if final is None:
             final = redeemed.finished(status, outcome, self._clock())
@@ -365,7 +433,21 @@ class UploadGateway:
         target = _FileTarget(queue, record.constraints, state)
         parser = StreamingFormDataParser(headers=request.headers, strict=True)
         parser.register(self._field, target)
-        pump = asyncio.create_task(_pump(request, parser, target, queue, state))
+        framer = Framer(boundary_of(request.headers), max_preamble=_MAX_PREAMBLE)
+        meter = _Meter()
+        request.state.mcp_upload_meter = meter
+        pump = asyncio.create_task(
+            _pump(request, parser, target, queue, state, framer, meter, self._stall_min_bytes)
+        )
+        watchdog = asyncio.create_task(
+            _watch(
+                pump,
+                meter,
+                state,
+                stall_timeout=self._stall_timeout,
+                upload_timeout=self._upload_timeout,
+            )
+        )
         try:
             # The upstream URL and headers need the filename and media type, which the
             # parser learns from the file part's headers. Wait for that, or for the pump
@@ -407,7 +489,7 @@ class UploadGateway:
                         "backend accepted before the upload finished",
                         upstream_status=response.status_code,
                     )
-            else:
+            elif not pump.cancelled():
                 await pump
             if state.error is not None:
                 raise state.error
@@ -433,6 +515,7 @@ class UploadGateway:
                 upstream_status=exc.upstream_status,
             )
         finally:
+            watchdog.cancel()
             if not pump.done():
                 pump.cancel()
                 with contextlib.suppress(BaseException):
@@ -558,18 +641,105 @@ class _FileTarget(BaseTarget):
         self.done = True
 
 
+class _Meter:
+    """How long the pump has waited on the client, shared with the watchdog.
+
+    The pump only stamps the clock around each read, which costs nothing measurable.
+    The checking happens in ``_watch`` once a second, off the hot path. A timeout armed
+    around every read cost a third of single-upload throughput.
+    """
+
+    __slots__ = ("waiting_since", "waited", "window_bytes", "body_done")
+
+    def __init__(self) -> None:
+        self.waiting_since: float | None = None
+        self.waited = 0.0
+        self.window_bytes = 0
+        self.body_done = False
+
+
+async def _watch(
+    pump: asyncio.Task[None],
+    meter: _Meter,
+    state: _PumpState,
+    *,
+    stall_timeout: float | None,
+    upload_timeout: float | None,
+) -> None:
+    """Stop an upload whose client is too slow or that has run too long.
+
+    Only time spent waiting for the client counts toward the stall limit. Time the pump
+    spends blocked because a slow backend is applying backpressure is not the client's
+    fault and is not charged to it.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = None if upload_timeout is None else loop.time() + upload_timeout
+    tick = 1.0 if stall_timeout is None else min(1.0, stall_timeout / 4)
+    while not pump.done():
+        await asyncio.sleep(tick)
+        now = loop.time()
+        code = None
+        if deadline is not None and now >= deadline:
+            code = "upload_timeout"
+        elif stall_timeout is not None:
+            since = meter.waiting_since
+            waited = meter.waited + (now - since if since is not None else 0.0)
+            if waited >= stall_timeout:
+                code = "too_slow"
+        if code is not None and not pump.done():
+            state.error = UploadError(code, "client did not deliver the body in time")
+            pump.cancel()
+            return
+
+
 async def _pump(
     request: Request,
     parser: StreamingFormDataParser,
     target: _FileTarget,
     queue: asyncio.Queue[Any],
     state: _PumpState,
+    framer: Framer,
+    meter: _Meter,
+    stall_min_bytes: int,
 ) -> None:
     """Read the request body and feed it to the parser. Any failure is recorded on
     ``state`` and signalled into the queue so the upstream body generator stops."""
+    loop = asyncio.get_running_loop()
     try:
-        async for chunk in request.stream():
-            await parser.adata_received(chunk)
+        fed = 0
+        stream = request.stream().__aiter__()
+        while True:
+            meter.waiting_since = loop.time()
+            try:
+                chunk = await stream.__anext__()
+            except StopAsyncIteration:
+                meter.body_done = True
+                break
+            finally:
+                meter.waited += loop.time() - meter.waiting_since
+                meter.waiting_since = None
+            meter.window_bytes += len(chunk)
+            if meter.window_bytes >= stall_min_bytes:
+                meter.window_bytes = 0
+                meter.waited = 0.0
+            try:
+                body = framer.feed(chunk)
+            except ValueError as exc:
+                raise UploadError("bad_multipart", str(exc)) from None
+            pieces = (
+                (body,)
+                if len(body) <= _FEED_SLICE
+                else [body[at : at + _FEED_SLICE] for at in range(0, len(body), _FEED_SLICE)]
+            )
+            for piece in pieces:
+                await parser.adata_received(piece)
+                fed += len(piece)
+                if fed - target.size > _MAX_OVERHEAD:
+                    raise UploadError("part_headers_too_large", "too much non-file data")
+            if framer.closed and framer.epilogue > _MAX_EPILOGUE:
+                # Everything the parser needs has arrived. The rest is ignorable by
+                # definition, so stop reading it rather than refuse a complete upload.
+                break
         if target.parts == 0:
             raise UploadError("missing_file", "no file part in the body")
         if not target.done:
@@ -640,6 +810,41 @@ def _upstream(
 
 
 # ----- small helpers -------------------------------------------------------------------
+
+
+async def _drain(receive: Any, limit: int = 1 << 20, timeout: float = 2.0) -> None:
+    """Read and discard up to ``limit`` body bytes or ``timeout`` seconds, whichever
+    ends first."""
+    seen = 0
+    with contextlib.suppress(Exception):
+        async with asyncio.timeout(timeout):
+            while seen <= limit:
+                message = await receive()
+                if message.get("type") != "http.request":
+                    return
+                seen += len(message.get("body", b""))
+                if not message.get("more_body", False):
+                    return
+
+
+def _narrow(allowed: tuple[str, ...], requested: tuple[str, ...] | None) -> tuple[str, ...]:
+    """A per-ticket accept list, checked to stay inside the destination's."""
+    if not requested:
+        return allowed
+    if not allowed:
+        return requested
+    destination = Constraints(accept=allowed)
+    for pattern in requested:
+        lowered = pattern.lower()
+        inside = (
+            any(a.lower() in ("*/*", lowered) for a in allowed)
+            if lowered.endswith("/*")
+            else destination.allows(lowered)
+        )
+        if not inside:
+            raise ValueError(f"accept type {pattern!r} is outside the destination's list")
+    return requested
+
 
 _NO_STORE = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
 

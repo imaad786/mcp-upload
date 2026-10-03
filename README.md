@@ -354,6 +354,8 @@ ticket, so a stray or hostile non-multipart POST cannot burn someone's pending u
 | `unknown_ticket` | 404 | |
 | `ticket_used`, `ticket_expired` | 410 | |
 | `too_large` | 413 | On declared length or on the running count |
+| `part_headers_too_large` | 400 | More than 512 KiB of the body is not file data |
+| `too_slow`, `upload_timeout` | 408 | Client stalled (under 64 KiB in 30 s of waiting), or the upload ran past an hour |
 | `too_many_uploads` | 503 | `max_in_flight` reached, ticket untouched, `Retry-After` set |
 | `missing_file`, `duplicate_file`, `unexpected_part`, `bad_multipart`, `truncated` | 400 | |
 | `invalid_media_type` | 400 | Declared type is not a valid `type/subtype` token |
@@ -417,10 +419,14 @@ Four things the library cannot do for you.
 
 - **TLS.** The ticket travels in the URL. Serve the endpoint over HTTPS only and set
   `base_url` to the `https` origin clients will use.
-- **Limits.** Set `max_in_flight` on the gateway. Each streaming upload holds a parser,
-  a queue and a backend connection, and beyond the cap a request gets 503 with
-  `Retry-After` before its ticket is touched. Per-client rate limiting and a request
-  size ceiling still belong at your reverse proxy. Both stores cap the number of
+- **Limits.** `max_in_flight` (100 by default) caps concurrent uploads per process.
+  Each one holds a parser, a queue and a backend connection, and beyond the cap a
+  request gets 503 with `Retry-After` before its ticket is touched. The default HTTP
+  client is sized to the same number. If you pass your own, give its pool at least
+  `max_in_flight` connections, or uploads queue for a connection after their tickets
+  are spent. Slow clients are cut off by `stall_timeout` and `stall_min_bytes` and long
+  ones by `upload_timeout`. Per-client rate limiting and a request size ceiling still
+  belong at your reverse proxy. Both stores cap the number of
   records they hold (`max_records`) and sweep expired ones when full.
 - **Destinations.** A destination is an address inside your network that the server
   streams client-supplied bytes to. Register only endpoints built to receive uploads.
@@ -466,8 +472,20 @@ uv venv .venv-fastmcp && uv pip install --python .venv-fastmcp/bin/python -e ".[
 .venv/bin/ruff check . && .venv/bin/mypy && .venv/bin/pytest
 ```
 
-Two environments because the two frameworks cannot share one. The suite includes
-socket-level tests that run the gateway and a backend under uvicorn on loopback.
+Two environments so each framework's adapter is tested without the other installed.
+The suite includes socket-level tests that run the gateway and a backend under uvicorn
+on loopback.
+
+`stress/run.py` is an end-to-end harness: the gateway, a backend and the load each run
+as separate processes over real sockets, and the gateway's memory is sampled from
+outside. It covers sustained throughput, hundreds of concurrent uploads, slow clients,
+oversized part headers, epilogues, bursts past the concurrency cap and a mixed run
+with failing clients and a flaky backend, and it writes JSON so two versions can be
+compared:
+
+```
+.venv/bin/python stress/run.py --src src --out after.json
+```
 
 ## Provenance
 
