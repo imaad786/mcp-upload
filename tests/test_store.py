@@ -203,11 +203,13 @@ async def test_sqlite_aclose_closes_every_connection_and_the_store_reopens(
     store = SqliteStore(tmp_path / "t.db")
     records = [make_record(str(i)) for i in range(20)]
     await asyncio.gather(*(store.put(r) for r in records))
-    assert (tmp_path / "t.db-wal").exists()
     await store.aclose()
-    # SQLite removes the write-ahead log when the last connection to the file closes,
-    # so its absence shows that no connection was left open.
-    assert not (tmp_path / "t.db-wal").exists()
+    # Leaving WAL mode needs exclusive access to the file, so it only succeeds when no
+    # other connection is open. Checking for the -wal file instead depends on the SQLite
+    # build: 3.54 keeps it after the last connection closes.
+    with closing(sqlite3.connect(tmp_path / "t.db")) as probe:
+        assert probe.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+        assert probe.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
     assert await store.get(records[0].id) == records[0]
     await store.aclose()
 
