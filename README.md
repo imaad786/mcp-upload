@@ -778,6 +778,18 @@ Four things the library cannot do for you.
 Vulnerabilities go through GitHub's private reporting on this repository. See
 `SECURITY.md`.
 
+## Stability
+
+From 1.0 the library follows semantic versioning. The public API is every name in
+`mcp_upload.__all__`, the adapters in `mcp_upload.adapters`, `mcp_upload.sinks`,
+`mcp_upload.client`, `mcp_upload.redis_store`, the error codes in `ERROR_STATUS` and
+the JSON shapes the endpoint returns. Anything starting with an underscore is not.
+
+The `files/authorizeUpload` method and the `FileValue` and `FileTransferDescriptor`
+shapes follow SEP-2631, which is a proposal. If it changes before it lands, the
+library will follow it in a minor release and say so in the changelog. Everything else
+changes only in a major release.
+
 ## Limits and non-goals
 
 Upload only. Server-to-client delivery is already covered by MCP resources. One file

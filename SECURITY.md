@@ -25,13 +25,35 @@ filename, streams to the destination without writing to disk, holds the end of t
 backend request until the whole upload has validated, never echoes a backend response,
 and never lets a tool argument become a URL, host or path.
 
+## Threat model
+
+Who can reach what, and what each of them can do:
+
+| Actor | Has | Can | Cannot |
+|---|---|---|---|
+| Anyone on the network | The endpoint URL | Fetch the upload page, send requests | Guess a ticket (256 bits), learn anything from refusals beyond an error code |
+| Holder of a valid ticket, usually the user or an agent acting for them | One upload URL | Upload one file to the one destination the ticket names, within its size, type and digest limits | Upload twice, choose the destination, read any file back, hold a slot by sending slowly, exhaust memory with oversized part headers |
+| A tool caller (often the model) | Tool arguments | Ask the server for a ticket, pass a file URI to a tool | Name a URL, host or path to stream into; use another owner's file when owners are set |
+| Another user of the same server | Record ids seen in transcripts | Nothing, when tickets carry an `owner` | Read another owner's status or claim their file |
+| The backend or a sink | The bytes it receives | Accept or refuse an upload | Have its response text echoed to the uploader |
+
+Every defence in that table has a scenario in `stress/run.py` that attacks it over real
+sockets: header bombs, slow clients, bursts past the concurrency cap, replayed and
+racing tickets, mismatched digests, other owners, a gateway killed mid-upload, malformed
+and randomized multipart framing, and failing clients and backends in one mixed run. A
+nightly CI job runs them and checks their invariants.
+
 ## What it does not guarantee, and what a deployment must do
 
 - **Transport security.** The ticket travels in the URL. Serve the endpoint over TLS
   only. Set `base_url` to an `https` origin.
-- **Rate limiting.** The library caps concurrent uploads when `max_in_flight` is set,
-  and refuses beyond it with 503. Per-client rate limiting and request-size limits at
-  the reverse proxy are still yours to configure.
+- **Rate limiting.** The library caps concurrent uploads per process with
+  `max_in_flight` (100 by default) and refuses beyond it with 503. Per-client rate
+  limiting, a cap across processes and request-size limits at the reverse proxy are
+  still yours to configure.
+- **Owners.** Pass `owner` when you issue tickets on a server with more than one user.
+  Without it, anyone who learns a record id can read that file's name, size and
+  digest.
 - **Destinations.** A destination is an address inside your network that the server
   will stream client-supplied bytes to. Register only endpoints built to receive
   uploads. Nothing a client sends can change which destination is used, but the

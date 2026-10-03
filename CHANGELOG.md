@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.0.0 (2026-10-03)
+
+SEP-2631's `files/authorizeUpload`, a client, and a stability promise. The API is now
+under semantic versioning; see "Stability" in the README.
+
+- **`files/authorizeUpload`.** `UploadTicketExtension(gateway, destination=...,
+  owner=...)` answers the proposal's method on the official SDK, and a twin in
+  `mcp_upload.adapters.fastmcp_extension` does on FastMCP 4. The declared size, digest
+  and type become the ticket's exact limits, and violations return -32602 with the
+  proposal's machine-readable data. Without arguments the extension behaves as before.
+- **`mcp_upload.client.upload_file`** hashes a file, authorizes it, streams it to the
+  descriptor and returns the file URI. **`resolve_file`** turns that URI, in a tool
+  argument, into a completed, owned and claimed upload.
+- **`UploadGateway.destination(name)`**, a public accessor for adapters.
+- **Fixed:** with `RedisStore(server_clock=True)`, a replica whose clock ran ahead still
+  refused tickets with its own clock before Redis could judge them. The gateway now
+  leaves expiry to such a store.
+- **Nightly stress job** (`.github/workflows/stress.yml`) runs the end-to-end scenarios,
+  the multipart fuzz and the SEP-2631 flows against real sockets and a real Redis, and
+  `stress/check.py` fails it on any broken invariant.
+- **Docs:** a threat model in `SECURITY.md`, and the measurements below.
+
+Live, on both frameworks: 50 concurrent authorize, upload and tool-call flows completed
+with the right SHA-256, and every mismatched, oversize, repeated or other-owner flow
+was refused, 90 of 90 per framework. Against 0.6.0 the full suite shows no regression.
+
+**Since 0.3.0**, measured on one machine with the same harness, medians of three
+alternating runs where marked:
+
+| | 0.3.0 | 1.0.0 |
+|---|---|---|
+| 64 MiB part header, `max_size` 1 MiB | completed, gateway at 4,305 MB | refused after 2 MiB, 56 MB |
+| 32 slow clients vs 40 honest uploads | 0 honest completed, slots held forever | 28 completed, slow clients cut at 35 s |
+| Burst against `max_in_flight=8` | 64 at the backend at once | 8 |
+| 3,000 randomized multipart bodies | 389 completed with wrong bytes | 0 |
+| 100 uploads with an epilogue | 0 completed | 100 |
+| Declared digest, owners, claim, crash recovery | not available | 0 wrong bytes, 0 leaks, 1 winner per claim, abandoned after 33 s |
+| SQLite-backed uploads, 400 at once | 175/s, p99 2,268 ms | 745/s, p99 534 ms |
+| SQLite ticket issue | 1,655/s | 11,434/s |
+| Redis round trips per upload | 7 | 3 |
+| One 1 GiB upload (median) | 999 MiB/s | 878 MiB/s |
+| 200 concurrent uploads (median) | 759 MiB/s | 734 MiB/s |
+
+The throughput cost arrived in 0.3.1 with the body bounds, the slow-client watchdog
+and RFC 2046 framing, and has been flat since: 884, 879, 877, 883 and 877 MiB/s from
+0.3.1 to 1.0.0.
+
 ## 0.6.0 (2026-10-03)
 
 Integration features: uploads into the server's own code, raw-body uploads, and a

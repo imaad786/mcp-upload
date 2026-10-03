@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Imaad Zaffar Khan", email = "kimaad71@gmail.com" }]
 keywords = ["mcp", "model-context-protocol", "file-upload", "upload", "starlette", "asgi"]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
