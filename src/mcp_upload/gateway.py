@@ -356,6 +356,11 @@ class UploadGateway:
         logger.info("issued %s for destination %s", record.id, dest.name)
         return Issued(record=record, secret=secret, upload_url=self.upload_url(secret))
 
+    def destination(self, name: str) -> Destination:
+        """The registered destination ``name``, for adapters that need its limits.
+        Raises ``UnknownDestination``."""
+        return self._registry.get(name)
+
     def upload_url(self, secret: str) -> str:
         return f"{self._base_url}{self._path}/{secret}"
 
@@ -551,7 +556,10 @@ class UploadGateway:
             return self._error_response(request, None, "unknown_ticket")
         if record.status is not Status.ISSUED:
             return self._error_response(request, record, "ticket_used")
-        if record.expired(now):
+        if record.expired(now) and not getattr(self._store, "decides_expiry", False):
+            # A store that judges expiry by its own clock (RedisStore with server_clock)
+            # has the final word at redemption. Pre-checking here with this replica's
+            # clock would refuse tickets the store would accept when the clocks differ.
             return self._error_response(request, record, "ticket_expired")
 
         # The multipart envelope adds a little to the file size. Reject only what is

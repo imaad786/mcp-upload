@@ -482,3 +482,47 @@ async def test_redis_server_clock_decides_expiry() -> None:
     won = await served.redeem(fresh.ticket_hash, ahead)
     assert isinstance(won, Record)
     assert won.redeemed_at == ahead  # the caller's time is what gets recorded
+
+
+async def test_gateway_leaves_expiry_to_a_store_on_the_server_clock() -> None:
+    # A replica whose clock runs ahead must not refuse a ticket that Redis, judging by
+    # its own clock, still accepts.
+    import httpx
+    from starlette.applications import Starlette
+
+    from mcp_upload import Destination, Registry, UploadGateway
+    from mcp_upload.redis_store import RedisStore
+
+    store = RedisStore(
+        _redis_client(),  # type: ignore[arg-type]
+        prefix=f"t{uuid.uuid4().hex}",
+        server_clock=True,
+    )
+    received: list[bytes] = []
+
+    async def backend(request: httpx.Request) -> httpx.Response:
+        received.append(await request.aread())
+        return httpx.Response(201)
+
+    now = datetime.now(UTC)
+    gateway = UploadGateway(
+        base_url="http://g",
+        registry=Registry(Destination(name="f", url="http://b/{id}")),
+        store=store,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(backend)),
+        clock=lambda: now,
+    )
+    issued = await gateway.issue("f", ttl=timedelta(minutes=5))
+    gateway._clock = lambda: now + timedelta(minutes=10)  # this replica's clock is ahead
+    body = (
+        b'--b\r\nContent-Disposition: form-data; name="file"; filename="a"\r\n\r\nhi\r\n--b--\r\n'
+    )
+    app = Starlette(routes=gateway.routes())
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://g") as c:
+        reply = await c.post(
+            issued.upload_url,
+            content=body,
+            headers={"Content-Type": "multipart/form-data; boundary=b"},
+        )
+    assert reply.json()["status"] == "completed", reply.text
+    assert received == [b"hi"]

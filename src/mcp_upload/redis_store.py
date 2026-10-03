@@ -193,6 +193,9 @@ class RedisStore:
         self._redis = client
         self._prefix = prefix
         self._server_clock = "1" if server_clock else "0"
+        #: Read by the gateway: when the store judges expiry against its own clock, the
+        #: gateway leaves the decision to it instead of pre-checking with the local one.
+        self.decides_expiry = server_clock
         self._legacy_layout = legacy_layout
         self._redeem: AsyncScript = client.register_script(_REDEEM_LUA)
         self._finish: AsyncScript = client.register_script(_FINISH_LUA)

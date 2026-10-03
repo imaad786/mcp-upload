@@ -17,6 +17,7 @@ reference ever travels through MCP.
 
 from .destinations import Destination, Registry, UnknownDestination
 from .gateway import ERROR_STATUS, ClaimRefused, Issued, UploadError, UploadGateway
+from .resolve import FileReferenceError, resolve_file
 from .sinks import IncomingFile, Sink, UploadAborted
 from .store import MemoryStore, SqliteStore, Store, StoreFull
 from .tickets import ClaimError, Constraints, Outcome, Record, RedeemError, Status
@@ -32,6 +33,7 @@ __all__ = [
     "Constraints",
     "Destination",
     "FileDigest",
+    "FileReferenceError",
     "FileTransferDescriptor",
     "FileValue",
     "IncomingFile",
@@ -52,4 +54,5 @@ __all__ = [
     "UploadGateway",
     "UploadStatus",
     "__version__",
+    "resolve_file",
 ]
