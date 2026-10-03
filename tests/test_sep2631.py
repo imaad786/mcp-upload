@@ -470,3 +470,115 @@ async def test_the_same_uri_cannot_be_used_twice(
     assert not first.is_error
     assert second.is_error
     assert "already been used" in str(second.content)
+
+
+def wire_request(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+    """A hand-built 2026-07-28 files/authorizeUpload request and its headers."""
+    params = {
+        **params,
+        "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {
+                "files": {"upload": True, "transports": ["https"]}
+            },
+        },
+    }
+    body = {"jsonrpc": "2.0", "id": 1, "method": "files/authorizeUpload", "params": params}
+    headers = {
+        "accept": "application/json, text/event-stream",
+        "mcp-protocol-version": "2026-07-28",
+        "mcp-method": "files/authorizeUpload",
+    }
+    return body, headers
+
+
+@pytest.mark.parametrize("stateless", [False, True])
+async def test_owner_from_the_access_token(gateway: UploadGateway, stateless: bool) -> None:
+    # The owner resolver the docs recommend: the authenticated user from the bearer
+    # token, read through the SDK's auth context inside the method handler.
+    import httpx2
+    from mcp.server.auth.middleware.auth_context import get_access_token
+    from mcp.server.auth.provider import AccessToken
+    from mcp.server.auth.settings import AuthSettings
+    from mcp.server.mcpserver import MCPServer
+    from pydantic import AnyHttpUrl
+
+    from mcp_upload.adapters.mcp_extension import UploadTicketExtension
+
+    class Tokens:
+        async def verify_token(self, token: str) -> AccessToken | None:
+            user = token.removesuffix("-token")
+            return AccessToken(token=token, client_id="app", subject=user, scopes=[])
+
+    def user_of(ctx: Any) -> str | None:
+        token = get_access_token()
+        return token.subject if token else None
+
+    server = MCPServer(
+        "auth",
+        auth=AuthSettings(
+            issuer_url=AnyHttpUrl("http://auth.test"),
+            resource_server_url=AnyHttpUrl("http://127.0.0.1:8000/mcp"),
+        ),
+        token_verifier=Tokens(),
+        extensions=[UploadTicketExtension(gateway, destination="files", owner=user_of)],
+    )
+    app = server.streamable_http_app(stateless_http=stateless, json_response=True)
+    body, headers = wire_request({"name": "a.txt"})
+    headers["authorization"] = "Bearer alice-token"
+    async with (
+        server.session_manager.run(),
+        httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://127.0.0.1:8000"
+        ) as http,
+    ):
+        response = await http.post("/mcp", json=body, headers=headers)
+    assert response.status_code == 200, response.text
+    uri = response.json()["result"]["file"]["uri"]
+    record_id = uri.rsplit("/", 1)[1]
+    assert (await gateway.status(record_id, owner="alice"))["status"] == "issued"
+    assert (await gateway.status(record_id, owner="bob"))["status"] == "unknown"
+
+
+@pytest.mark.parametrize("stateless", [False, True])
+async def test_the_wire_shape_over_streamable_http(
+    gateway: UploadGateway, uploads: httpx.AsyncClient, stateless: bool
+) -> None:
+    # A hand-built 2026-07-28 request, so the field names are the proposal's and not
+    # whatever the SDK's own client happens to send.
+    import httpx2
+
+    server = build("mcp", gateway)
+    app = server.streamable_http_app(stateless_http=stateless, json_response=True)
+    data = b"wire"
+    body, headers = wire_request(
+        {
+            "name": "w.txt",
+            "mimeType": "text/plain",
+            "size": len(data),
+            "digest": {"algorithm": "sha-256", "value": b64(data)},
+        }
+    )
+    # The SDK refuses Host headers other than loopback unless configured otherwise.
+    loopback = "http://127.0.0.1:8000"
+    async with (
+        server.session_manager.run(),
+        httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app), base_url=loopback) as http,
+    ):
+        response = await http.post("/mcp", json=body, headers=headers)
+    assert response.status_code == 200, response.text
+    result = response.json()["result"]
+    file, upload = result["file"], result["upload"]
+    assert file["uri"].startswith("mcp-file://test/up_")
+    assert file["name"] == "w.txt"
+    assert file["mimeType"] == "text/plain"
+    assert file["size"] == len(data)
+    assert file["digest"] == {"algorithm": "sha-256", "value": b64(data)}
+    assert upload["method"] == "POST"
+    assert upload["multipart"] == {"fileField": "file"}
+    assert upload["expiresAt"].endswith("Z")
+
+    form, content_type = multipart([("file", "w.txt", data, "text/plain")])
+    posted = await uploads.post(upload["url"], content=form, headers={"Content-Type": content_type})
+    assert posted.status_code == 200, posted.text
+    assert (await resolve_file(gateway, file["uri"]))["digest"] == file["digest"]
