@@ -300,7 +300,12 @@ attach(mcp, gateway)
 - The declared `size` becomes the ticket's exact size and the declared `digest` its
   exact SHA-256, so different bytes are refused with `digest_mismatch` or
   `size_mismatch` before the backend commits them. A declared `mimeType` becomes the
-  ticket's only accepted type.
+  ticket's only accepted type. Parameters such as `charset` are kept: the result
+  echoes `text/plain; charset=utf-8` exactly as sent, and the upload is matched on
+  `text/plain` alone.
+- Some clients send the file part with no `filename`. The library accepts it, since
+  the part is under the field the descriptor named for the file, and names the file
+  `upload`. A part under any other field name is still refused.
 
 `UploadTicketExtension()` with no arguments still only advertises the capability.
 
@@ -363,6 +368,12 @@ see on protocol 2026-07-28 connections. A client that does not find it there sho
 send the request anyway and treat -32601 as "not supported". On the server, a raw
 `files` capability a client sent is readable at
 `ctx.params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["files"]`.
+
+**Downloads are not served.** The library does not serve `files/authorizeDownload`,
+because downloads are a non-goal. A host that sees an `mcp-file://` URI in a tool
+result may try to download it through that method and fail. So if your tool's
+callers include hosts that do that, such as some gateways, return the file's metadata
+without the `uri` member. Keep the `uri` only when you know they will not try.
 
 SEP-2631 is a proposal, not part of the specification, and the method name and
 shapes may change before it lands.

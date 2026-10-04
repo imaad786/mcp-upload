@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.0.2 (2026-10-04)
+
+Two interop fixes, found by driving an independent SEP-2631 gateway, waygate 1.1.0,
+against this library.
+
+- **Fixed:** a file part sent with no `filename` parameter was refused with
+  `missing_file`. waygate never sends one, and RFC 7578 says a filename SHOULD be
+  sent, not MUST. A part under the file field with no filename is now the file, named
+  `upload`. A part under any other name is still `unexpected_part`, two file parts are
+  still `duplicate_file`, and an empty `filename=""`, which is what a browser sends
+  when no file was chosen, is still `missing_file`.
+- **Fixed:** media type parameters were dropped. `text/plain; charset=utf-8` was
+  recorded, forwarded and returned as `text/plain`, so a client that compares the
+  `mimeType` it gets back with the one it declared saw it change. The declared value
+  is now kept as sent, in `mimeType`, in the Content-Type forwarded to the backend and
+  in the `files/authorizeUpload` result. The accept list still matches on
+  `type/subtype` alone. Parameters are held to a strict grammar (`token=token` or
+  `token="quoted"`, printable ASCII only, 255 characters in all), and a value that
+  fails it is `invalid_media_type`, or `invalidMimeType` on `files/authorizeUpload`.
+- **Docs:** the guide notes that `files/authorizeDownload` is not served, so a tool
+  whose results may reach a host that tries to download `mcp-file://` URIs should
+  return file metadata without the `uri`.
+
+Live against waygate 1.1.0, with no filename shim: 1 KB text, 16 KB binary with no
+declared type, 1 MiB, 20 MiB and a `text/plain; charset=utf-8` upload each failed on
+1.0.1 and completed on 1.0.2, with the stored bytes' SHA-256 equal to the source's.
+Against 1.0.1 on the same harness, the full stress suite (Redis scenarios not run) and
+3,000 fuzzed multipart bodies hold every invariant, and medians of three alternating
+throughput runs are unchanged: one 1 GiB upload 888 and 888 MiB/s, 200 concurrent
+750 and 748 MiB/s, one 512 MiB upload in 16 KiB frames 717 and 728 MiB/s.
+
 ## 1.0.1 (2026-10-03)
 
 - **Fixed:** the upload page showed an empty progress bar before an upload started.

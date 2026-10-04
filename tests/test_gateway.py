@@ -36,6 +36,10 @@ from tests.conftest import BASE_URL, Upstream, multipart
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
 
 
+def b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+
+
 async def issue(gateway: UploadGateway, destination: str = "files", **kw: object) -> Issued:
     return await gateway.issue(destination, **kw)  # type: ignore[arg-type]
 
@@ -250,13 +254,66 @@ async def test_duplicate_file_parts_are_refused_and_not_committed(
     assert (await gateway.status(issued.record.id))["status"] == "failed"
 
 
-async def test_part_without_filename_is_not_a_file(
+async def test_part_without_filename_in_the_file_field_is_the_file(
+    client: httpx.AsyncClient, gateway: UploadGateway, upstream: Upstream
+) -> None:
+    # Some SEP-2631 clients send the file part with no filename parameter at all. The
+    # field is the one the gateway named for the file, so the part is the file.
+    data = bytes(range(256)) * 3
+    issued = await issue(gateway, expected_size=len(data), expected_digest=b64(data))
+    response = await post(client, issued.upload_url, [("file", None, data, None)])
+    assert response.status_code == 200, response.text
+    file = response.json()["file"]
+    assert (file["name"], file["mimeType"], file["size"]) == (
+        "upload",
+        "application/octet-stream",
+        len(data),
+    )
+    assert file["digest"]["value"] == b64(data)
+    assert upstream.bodies == [data]
+    assert str(upstream.requests[0].url) == "http://backend.test/files/upload"
+
+
+async def test_part_with_an_empty_filename_is_not_a_file(
+    client: httpx.AsyncClient, gateway: UploadGateway, upstream: Upstream
+) -> None:
+    # An empty filename is what a browser sends for a file input with nothing chosen.
+    issued = await issue(gateway)
+    response = await post(client, issued.upload_url, [("file", "", b"", None)])
+    assert response.status_code == 400
+    assert response.json()["error"] == "missing_file"
+    assert upstream.requests == []
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [
+        [("token", None, b"just text", None)],
+        [("file", None, b"the file", None), ("token", None, b"smuggled", None)],
+    ],
+)
+async def test_part_without_filename_under_another_name_is_still_refused(
+    client: httpx.AsyncClient,
+    gateway: UploadGateway,
+    upstream: Upstream,
+    parts: list[tuple[str, str | None, bytes, str | None]],
+) -> None:
+    issued = await issue(gateway)
+    response = await post(client, issued.upload_url, parts)
+    assert response.status_code == 400
+    assert response.json()["error"] == "unexpected_part"
+    assert upstream.requests == []
+
+
+async def test_two_parts_without_filename_are_a_duplicate(
     client: httpx.AsyncClient, gateway: UploadGateway, upstream: Upstream
 ) -> None:
     issued = await issue(gateway)
-    response = await post(client, issued.upload_url, [("file", None, b"just text", None)])
+    response = await post(
+        client, issued.upload_url, [("file", None, b"one", None), ("file", None, b"two", None)]
+    )
     assert response.status_code == 400
-    assert response.json()["error"] == "missing_file"
+    assert response.json()["error"] == "duplicate_file"
     assert upstream.requests == []
 
 
@@ -336,6 +393,89 @@ async def test_invalid_media_type_is_refused_before_anything_is_forwarded(
     status = await gateway.status(issued.record.id)
     assert status["status"] == "failed"
     assert status["error"] == "invalid_media_type"
+
+
+@pytest.mark.parametrize(
+    "declared",
+    ["text/plain; charset=utf-8", 'Text/Plain;charset="utf-8"; format=flowed', "text/csv"],
+)
+async def test_media_type_parameters_are_kept_as_declared(
+    client: httpx.AsyncClient, gateway: UploadGateway, upstream: Upstream, declared: str
+) -> None:
+    data = b"col\n1\n"
+    issued = await issue(gateway)
+    response = await post(client, issued.upload_url, [("file", "a.txt", data, declared)])
+    assert response.status_code == 200, response.text
+    assert response.json()["file"]["mimeType"] == declared
+    assert upstream.requests[0].headers["content-type"] == declared
+    assert upstream.bodies == [data]
+    assert (await gateway.status(issued.record.id))["file"]["mimeType"] == declared
+
+
+async def test_media_type_parameters_reach_a_multipart_backend_and_match_on_the_base_type(
+    client: httpx.AsyncClient, gateway: UploadGateway, upstream: Upstream
+) -> None:
+    # The images destination accepts image/* and forwards as multipart.
+    issued = await issue(gateway, "images")
+    declared = "image/svg+xml; charset=utf-8"
+    response = await post(client, issued.upload_url, [("file", "a.svg", b"<svg/>", declared)])
+    assert response.status_code == 200, response.text
+    assert response.json()["file"]["mimeType"] == declared
+    assert f"Content-Type: {declared}\r\n".encode() in upstream.bodies[0]
+
+    refused = await issue(gateway, "images")
+    response = await post(
+        client, refused.upload_url, [("file", "a.txt", b"x", "text/plain; charset=utf-8")]
+    )
+    assert response.status_code == 415
+    assert response.json()["details"]["mimeType"] == "text/plain"
+    assert len(upstream.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        "text/plain; charset",
+        "text/plain;",
+        'text/plain; charset="utf-8',
+        "text/plain; charset=utf 8",
+        "text/plain; charset=utf-8\x01",
+        "text/plain;\r\n charset=utf-8",
+        "garbage",
+        "text/plain; x=" + "a" * 300,
+    ],
+)
+async def test_malformed_media_type_parameters_are_refused(
+    client: httpx.AsyncClient, gateway: UploadGateway, upstream: Upstream, declared: str
+) -> None:
+    # Before 1.0.2 the parameters were dropped unread. Now they are kept, so they are
+    # held to a strict grammar. The last two the parser itself would have read as
+    # text/plain and text/plain.
+    issued = await issue(gateway)
+    response = await post(client, issued.upload_url, [("file", "a.txt", b"x", declared)])
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_media_type"
+    assert upstream.requests == []
+
+
+async def test_a_part_type_the_parser_reads_differently_is_refused(
+    client: httpx.AsyncClient, gateway: UploadGateway, upstream: Upstream
+) -> None:
+    # The gateway reads the part's Content-Type itself to keep its parameters. When
+    # the parser sees no type where the gateway sees one, neither is trusted.
+    issued = await issue(gateway)
+    body = (
+        b'--B\r\nContent-Disposition: form-data; name="file"\r\n'
+        b"Content-Type : text/plain; charset=utf-8\r\n\r\nhi\r\n--B--\r\n"
+    )
+    response = await client.post(
+        issued.upload_url,
+        content=body,
+        headers={"Content-Type": "multipart/form-data; boundary=B"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_media_type"
+    assert upstream.requests == []
 
 
 async def test_in_flight_cap_refuses_with_503_and_leaves_the_ticket_usable(

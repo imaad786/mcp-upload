@@ -282,6 +282,50 @@ async def test_bytes_that_differ_from_the_declared_digest_are_refused(
     assert refused.value.reason == "failed"
 
 
+@pytest.mark.parametrize("framework", FRAMEWORKS)
+async def test_a_parameterized_media_type_is_echoed_exactly_through_the_flow(
+    framework: str, gateway: UploadGateway, uploads: httpx.AsyncClient, upstream: Upstream
+) -> None:
+    # The wire shapes of waygate 1.1.0: a mimeType with parameters, and a file part
+    # with no filename. A client may compare the mimeType it gets back exactly.
+    data = b"caf\xc3\xa9\n" * 10
+    declared = "text/plain; charset=utf-8"
+    async with connect(framework, build(framework, gateway)) as client:
+        authorized = await authorize_upload(
+            client, mime_type=declared, size=len(data), digest=b64(data)
+        )
+        assert authorized["file"]["mimeType"] == declared
+        body, content_type = multipart([("file", None, data, declared)])
+        posted = await uploads.post(
+            authorized["upload"]["url"], content=body, headers={"Content-Type": content_type}
+        )
+        assert posted.status_code == 200, posted.text
+        assert posted.json()["file"]["mimeType"] == declared
+        result = await call(framework, client, "ingest", {"file": authorized["file"]["uri"]})
+
+    assert not result.is_error, result.content
+    file = result.structured_content
+    assert file is not None
+    assert (file["name"], file["mimeType"], file["size"]) == ("upload", declared, len(data))
+    assert file["digest"] == {"algorithm": "sha-256", "value": b64(data)}
+    assert upstream.bodies == [data]
+    assert upstream.requests[0].headers["content-type"] == declared
+
+
+@pytest.mark.parametrize("framework", FRAMEWORKS)
+async def test_an_authorized_type_matches_uploads_on_the_base_type(
+    framework: str, gateway: UploadGateway, uploads: httpx.AsyncClient
+) -> None:
+    async with connect(framework, build(framework, gateway)) as client:
+        authorized = await authorize_upload(client, mime_type="text/plain; charset=utf-8")
+        body, content_type = multipart([("file", "a.png", b"x", "image/png")])
+        posted = await uploads.post(
+            authorized["upload"]["url"], content=body, headers={"Content-Type": content_type}
+        )
+    assert posted.status_code == 415
+    assert posted.json()["details"]["accept"] == ["text/plain"]
+
+
 async def test_upload_file_reports_a_refused_upload(
     gateway: UploadGateway, uploads: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -321,6 +365,9 @@ async def test_upload_file_reports_a_refused_upload(
             {"reason": "mimeTypeNotAccepted", "mimeType": "text/plain", "accept": ["image/*"]},
         ),
         ("files", {"mime_type": "not a type"}, {"reason": "invalidMimeType"}),
+        ("files", {"mime_type": "text/plain; charset"}, {"reason": "invalidMimeType"}),
+        ("files", {"mime_type": 'text/plain; a="b\r\n'}, {"reason": "invalidMimeType"}),
+        ("files", {"mime_type": "image/*"}, {"reason": "invalidMimeType"}),
         ("files", {"digest": "not-base64!"}, {"reason": "invalidDigest"}),
         ("files", {"digest": b64(b"x")[:20]}, {"reason": "invalidDigest"}),
         ("files", {"digest": {"algorithm": "md5", "value": "x"}}, {"reason": "invalidDigest"}),

@@ -131,8 +131,9 @@ curl -T report.pdf -H "Content-Type: application/pdf" \
      -H 'Content-Disposition: attachment; filename="report.pdf"' <url>
 ```
 
-- The media type is the request's Content-Type, held to the same token grammar and
-  accept list as a form part's. Without one it is `application/octet-stream`.
+- The media type is the request's Content-Type, held to the same grammar and accept
+  list as a form part's. Parameters such as `charset` are kept and forwarded, and the
+  accept list is matched on the type alone. Without one it is `application/octet-stream`.
 - The filename comes from a `Content-Disposition` request header, where the RFC 8187
   form `filename*=UTF-8''...` wins over plain `filename=`, else from a `filename`
   query parameter, else it is `upload`. It is reduced to a safe base name like any

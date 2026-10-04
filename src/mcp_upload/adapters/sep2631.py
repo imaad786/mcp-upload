@@ -22,7 +22,6 @@ A server without the method answers ``-32601``, which the SDK does on its own.
 from __future__ import annotations
 
 import inspect
-import re
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -32,6 +31,7 @@ from pydantic import BaseModel, ConfigDict
 
 from ..destinations import Destination, UnknownDestination
 from ..gateway import UploadGateway
+from ..multipart import split_media_type
 from ..store import StoreFull
 from ..tickets import Constraints, sha256_hex
 from ..types import FileDigest, FileValue
@@ -48,11 +48,6 @@ METHOD = "files/authorizeUpload"
 #: Maps the request context to the owner the ticket is bound to, typically the
 #: authenticated user. May be a plain function or a coroutine function.
 OwnerResolver = Callable[["ServerRequestContext[Any, Any]"], "str | None | Awaitable[str | None]"]
-
-# A media type as RFC 9110 writes one: two tokens and a slash. Parameters are
-# dropped before matching, and a wildcard is not a file's type.
-_TCHARS = r"[A-Za-z0-9!#$%&'+.^_`|~-]+"
-_MEDIA_TYPE = re.compile(rf"^{_TCHARS}/{_TCHARS}$")
 
 
 class Digest(BaseModel):
@@ -145,7 +140,8 @@ class AuthorizeUpload:
                 dest.name,
                 caller=METHOD,
                 owner=owner,
-                accept=(mime_type,) if mime_type else None,
+                # The ticket matches on type/subtype only, as an upload's is.
+                accept=(mime_type.split(";", 1)[0].strip().lower(),) if mime_type else None,
                 expected_size=params.size,
                 expected_digest=digest,
             )
@@ -178,7 +174,9 @@ class AuthorizeUpload:
 
 def check(params: AuthorizeUploadParams, dest: Destination) -> str | None:
     """Refuse a declaration the destination will never accept, with the reason as
-    data. Returns the declared media type without parameters, or ``None``."""
+    data. Returns the declared media type as declared, parameters included, or
+    ``None``. It is echoed in the result, where a client may compare it exactly with
+    what it sent."""
     if params.digest is not None:
         algorithm = params.digest.algorithm.lower()
         if algorithm != "sha-256":
@@ -204,11 +202,14 @@ def check(params: AuthorizeUploadParams, dest: Destination) -> str | None:
             )
     if params.mime_type is None:
         return None
-    mime_type = params.mime_type.split(";", 1)[0].strip().lower()
-    if not _MEDIA_TYPE.match(mime_type) or len(mime_type) > 255:
+    # Malformed parameters are refused like a malformed type, and a wildcard is not a
+    # file's type. Only type/subtype is matched against the accept list.
+    parsed = split_media_type(params.mime_type)
+    if parsed is None or "*" in parsed[0]:
         raise invalid(
             "mimeType is not a media type", reason="invalidMimeType", mimeType=params.mime_type
         )
+    mime_type, declared = parsed
     if not Constraints(accept=dest.accept).allows(mime_type):
         raise invalid(
             f"{mime_type} is not accepted here",
@@ -216,7 +217,7 @@ def check(params: AuthorizeUploadParams, dest: Destination) -> str | None:
             mimeType=mime_type,
             accept=list(dest.accept),
         )
-    return mime_type
+    return declared
 
 
 def destination_of(gateway: UploadGateway, name: str) -> Destination:

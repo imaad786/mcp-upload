@@ -46,6 +46,51 @@ def parse_content_type(value: str | None) -> tuple[str, dict[str, str]]:
     return head.strip().lower(), params
 
 
+# A media type with its parameters, as RFC 9110 writes one, but stricter: each
+# parameter is ``token=token`` or ``token="quoted string"``, only spaces may sit around
+# the semicolons, and nothing outside printable ASCII is allowed anywhere, so no CR, LF
+# or other control character can get through. The value is kept as the client wrote
+# it, because it becomes a header to the backend and the ``mimeType`` a client may
+# compare with what it declared.
+_TCHARS = r"[!#$%&'*+.^_`|~0-9A-Za-z-]+"
+_QUOTED = r'"(?:[ !#-\[\]-~]|\\[ -~])*"'
+_MEDIA_TYPE = re.compile(rf"({_TCHARS}/{_TCHARS})((?: *; *{_TCHARS}=(?:{_TCHARS}|{_QUOTED}))*)")
+MAX_MEDIA_TYPE_LENGTH = 255
+
+
+def split_media_type(value: str) -> tuple[str, str] | None:
+    """Check a declared media type. Returns its ``type/subtype`` in lowercase, for
+    matching, and the whole value as declared, parameters included, for recording.
+    None when it is not a media type, its parameters are malformed, or it is longer
+    than ``MAX_MEDIA_TYPE_LENGTH``."""
+    declared = value.strip(" \t")
+    if len(declared) > MAX_MEDIA_TYPE_LENGTH:
+        return None
+    match = _MEDIA_TYPE.fullmatch(declared)
+    if match is None:
+        return None
+    return match.group(1).lower(), declared
+
+
+def content_type_of_part(head: bytes) -> str | None:
+    """The Content-Type value in a multipart part's header block, as sent. ``head`` is
+    everything from the delimiter line up to the blank line. The last Content-Type
+    wins, as it does in the parser. A folded continuation line stays in the value with
+    its CRLF, so ``split_media_type`` refuses it. None when there is no Content-Type."""
+    found: str | None = None
+    in_type = False
+    for line in head.split(b"\r\n")[1:]:
+        if line[:1] in (b" ", b"\t"):
+            if in_type and found is not None:
+                found += "\r\n" + line.decode("latin-1")
+            continue
+        name, colon, value = line.partition(b":")
+        in_type = bool(colon) and name.strip().lower() == b"content-type"
+        if in_type:
+            found = value.decode("latin-1").strip(" \t")
+    return found
+
+
 def multipart_error(headers: Mapping[str, str]) -> str | None:
     """Return an error code if this request cannot carry a file, else None."""
     media_type, params = parse_content_type(headers.get("content-type"))

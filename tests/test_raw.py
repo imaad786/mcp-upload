@@ -77,11 +77,28 @@ async def test_raw_body_is_the_file(
     )
     assert response.status_code == 200, response.text
     file = response.json()["file"]
-    assert (file["name"], file["mimeType"], file["size"]) == ("notes.txt", "text/plain", len(data))
+    # The media type is kept as declared, parameters included, and forwarded as is.
+    assert (file["name"], file["mimeType"], file["size"]) == (
+        "notes.txt",
+        "Text/Plain; charset=utf-8",
+        len(data),
+    )
     assert file["digest"]["value"] == b64(data)
     assert upstream.bodies == [data]
     assert str(upstream.requests[0].url) == "http://backend.test/files/notes.txt"
-    assert upstream.requests[0].headers["content-type"] == "text/plain"
+    assert upstream.requests[0].headers["content-type"] == "Text/Plain; charset=utf-8"
+
+
+async def test_raw_media_type_matches_the_accept_list_on_the_base_type(
+    client: httpx.AsyncClient, raw: UploadGateway, upstream: Upstream
+) -> None:
+    issued = await raw.issue("images")
+    declared = "image/svg+xml; charset=utf-8"
+    response = await client.put(
+        issued.upload_url, content=b"<svg/>", headers={"Content-Type": declared}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["file"]["mimeType"] == declared
 
 
 @pytest.mark.parametrize(
@@ -302,6 +319,10 @@ async def test_matching_declared_digest_completes(
         ("images", "text/plain", "unsupported_media_type", 415),
         ("files", "image/png x", "invalid_media_type", 400),
         ("files", "a" * 300 + "/b", "invalid_media_type", 400),
+        ("files", "text/plain; charset", "invalid_media_type", 400),
+        ("files", 'text/plain; charset="utf-8', "invalid_media_type", 400),
+        ("files", "text/plain;; charset=utf-8", "invalid_media_type", 400),
+        ("images", "text/plain; charset=utf-8", "unsupported_media_type", 415),
         ("files", "application/x-www-form-urlencoded", "not_multipart", 415),
         ("files", "multipart/mixed; boundary=x", "not_multipart", 415),
         ("files", "multipart/form-data", "missing_boundary", 400),

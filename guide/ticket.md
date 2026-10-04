@@ -98,10 +98,11 @@ ticket, so a stray or hostile non-multipart POST cannot burn someone's pending u
 4. The atomic flip. From here the ticket is spent.
 5. The body streams. The size limit is enforced on the bytes actually seen, because a
    chunked upload has no `Content-Length` and a lying one is trivial to send. Exactly
-   one part, named `file`, with a filename, of an accepted type. A second file part,
-   a part without a filename, or any other part is refused. Frameworks that silently
-   keep one of two same-named parts are how a request passes validation on one and
-   delivers the other. Filenames are reduced to a base name before forwarding.
+   one part, named `file`, of an accepted type. A second file part, a part with an
+   empty filename, or any other part is refused. Frameworks that silently keep one of
+   two same-named parts are how a request passes validation on one and delivers the
+   other. Filenames are reduced to a base name before forwarding, and a part without
+   one is named `upload`.
 6. The terminal state is recorded.
 
 | Code | HTTP | Meaning |
@@ -115,7 +116,7 @@ ticket, so a stray or hostile non-multipart POST cannot burn someone's pending u
 | `too_slow`, `upload_timeout` | 408 | Client stalled (under 64 KiB in 30 s of waiting), or the upload ran past an hour |
 | `too_many_uploads` | 503 | `max_in_flight` reached, ticket untouched, `Retry-After` set |
 | `missing_file`, `duplicate_file`, `unexpected_part`, `bad_multipart`, `truncated` | 400 | |
-| `invalid_media_type` | 400 | Declared type is not a valid `type/subtype` token. Ticket untouched on a raw upload. |
+| `invalid_media_type` | 400 | Declared type is not a valid `type/subtype`, or its parameters are malformed. Ticket untouched on a raw upload. |
 | `unsupported_media_type` | 415 | Declared type not in the accept list. Ticket untouched on a raw upload. |
 | `client_disconnected` | 400 | Recorded on the record. No response reaches the client. |
 | `abandoned` | (status only) | The process streaming the upload died. Reported once `upload_timeout` plus 30 s has passed. |

@@ -28,7 +28,6 @@ import asyncio
 import contextlib
 import hashlib
 import logging
-import re
 import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -51,11 +50,12 @@ from .destinations import Destination, Registry, UnknownDestination
 from .multipart import (
     Framer,
     boundary_of,
+    content_type_of_part,
     filename_from_disposition,
     multipart_error,
-    parse_content_type,
     raw_body_allowed,
     sanitize_filename,
+    split_media_type,
 )
 from .sinks import IncomingFile, UploadAborted
 from .store import Store, StoreFull
@@ -81,13 +81,6 @@ from .types import AwaitingUpload, FileDigest, FileTransferDescriptor, FileValue
 logger = logging.getLogger("mcp_upload")
 logger.addHandler(logging.NullHandler())
 
-# The token grammar of RFC 7230, which is what a media type is made of. Anything the
-# multipart parser hands us that does not match is refused rather than forwarded,
-# because the value becomes a request header to the backend and a field on the record.
-_TCHARS = r"[A-Za-z0-9!#$%&'*+.^_`|~-]+"
-_MEDIA_TYPE = re.compile(rf"^{_TCHARS}/{_TCHARS}$")
-_MAX_MEDIA_TYPE_LENGTH = 255
-
 # Bounds on everything in the body that is not file data. The multipart parser buffers
 # part headers whole, with cost that grows faster than their size: a 64 MiB header
 # drove one process past 4 GB while max_size was 1 MiB, because max_size only counts
@@ -102,6 +95,10 @@ _MAX_OVERHEAD = 512 * 1024
 _FEED_SLICE = 256 * 1024
 _MAX_PREAMBLE = 16 * 1024
 _MAX_EPILOGUE = 64 * 1024
+# How much of the file part's header block is kept to read its Content-Type as sent,
+# since the parser reports the type without its parameters. Real part headers are a
+# few hundred bytes. Past this the parser's value is used, as it was before 1.0.2.
+_MAX_PART_HEAD = 16 * 1024
 
 # Every failure the endpoint can report, and the HTTP status it maps to. Backend error
 # text is never passed through; a backend failure becomes one of these codes.
@@ -855,6 +852,10 @@ class _FileTarget(BaseTarget):
         self.size = 0
         self.filename: str | None = None
         self.media_type: str | None = None
+        # The part's Content-Type header as sent, parameters included, when the body
+        # read it from the part's header block. None is a part without one.
+        self.part_content_type: str | None = None
+        self.part_head_read = False
         self.hasher = hashlib.sha256()
         self.done = False
         self._announced = False
@@ -877,11 +878,25 @@ class _FileTarget(BaseTarget):
         if self._announced:
             return
         self._announced = True
-        if not self.multipart_filename:
-            # A part with the right name but no filename is a plain form field, not a
-            # file. Treating it as a file is how a text value ends up read as bytes.
-            raise UploadError("missing_file", "the file part has no filename")
-        self.media_type = _checked_media_type(self.multipart_content_type, self._constraints)
+        if self.multipart_filename == "":
+            # An empty filename is what a browser sends for a file input with nothing
+            # chosen, so there is no file here.
+            raise UploadError("missing_file", "the file part has an empty filename")
+        # A part with no filename parameter at all is still the file. This field is
+        # the one the gateway named for the file, so a value in it is the file, and
+        # strict parsing already refuses a part under any other name. RFC 7578 only
+        # says a filename SHOULD be sent, and some SEP-2631 clients never send one.
+        # It is then named by sanitize_filename's default.
+        declared = self.multipart_content_type
+        if self.part_head_read:
+            declared = self.part_content_type
+            parsed = None if declared is None else split_media_type(declared)
+            seen = None if parsed is None else parsed[0]
+            if (declared is None or parsed is not None) and seen != self.multipart_content_type:
+                # The parser read a different type from the same header. Refuse rather
+                # than record one value and let something else act on the other.
+                raise UploadError("invalid_media_type", "part Content-Type is ambiguous")
+        self.media_type = _checked_media_type(declared, self._constraints)
         self.filename = sanitize_filename(self.multipart_filename)
         self._state.started.set()
 
@@ -1009,6 +1024,22 @@ class _MultipartBody:
         self._framer = Framer(boundary_of(headers), max_preamble=_MAX_PREAMBLE)
         self._target = target
         self._fed = 0
+        self._head = bytearray()
+        self._head_done = False
+
+    def _read_head(self, body: bytes) -> None:
+        """Keep the first part's header block until it ends, then hand its
+        Content-Type to the target. Strict parsing refuses any part not named for the
+        file, so the first part is the only one whose headers can matter."""
+        start = max(0, len(self._head) - 3)
+        self._head += body[: _MAX_PART_HEAD + 4 - len(self._head)]
+        end = self._head.find(b"\r\n\r\n", start)
+        if end >= 0:
+            self._target.part_content_type = content_type_of_part(bytes(self._head[:end]))
+            self._target.part_head_read = True
+        if end >= 0 or len(self._head) > _MAX_PART_HEAD:
+            self._head_done = True
+            self._head = bytearray()
 
     async def feed(self, chunk: bytes) -> bool:
         """Hand one read to the parser. True when the rest of the body can be ignored."""
@@ -1016,6 +1047,8 @@ class _MultipartBody:
             body = self._framer.feed(chunk)
         except ValueError as exc:
             raise UploadError("bad_multipart", str(exc)) from None
+        if not self._head_done and body:
+            self._read_head(body)
         pieces = (
             (body,)
             if len(body) <= _FEED_SLICE
@@ -1314,13 +1347,15 @@ def _iso(when: datetime) -> str:
 
 
 def _checked_media_type(declared: str | None, constraints: Constraints) -> str:
-    """A declared media type, reduced to ``type/subtype`` and checked. It is about to
-    become a header on the backend request and a field on the record, and both the
-    multipart parser and a raw request pass the value through as-is, control characters
-    and all, so it has to be a real token. Then it has to be on the accept list."""
-    media_type = (declared or "application/octet-stream").split(";", 1)[0].strip().lower()
-    if len(media_type) > _MAX_MEDIA_TYPE_LENGTH or not _MEDIA_TYPE.fullmatch(media_type):
-        raise UploadError("invalid_media_type", "declared media type is not a valid token")
+    """A declared media type, checked and returned as declared, parameters included.
+    It is about to become a header on the backend request and a field on the record,
+    and a raw request passes the value through as-is, control characters and all, so
+    it has to match the strict grammar of ``split_media_type``. Then its
+    ``type/subtype`` has to be on the accept list. Parameters are kept, not matched."""
+    parsed = split_media_type(declared or "application/octet-stream")
+    if parsed is None:
+        raise UploadError("invalid_media_type", "declared media type is not a valid media type")
+    media_type, full = parsed
     if not constraints.allows(media_type):
         raise UploadError(
             "unsupported_media_type",
@@ -1331,15 +1366,15 @@ def _checked_media_type(declared: str | None, constraints: Constraints) -> str:
                 "accept": list(constraints.accept),
             },
         )
-    return media_type
+    return full
 
 
 def _raw_file(request: Request, constraints: Constraints) -> tuple[str, str]:
     """The filename and media type of a raw upload, from its headers. The filename is
     the Content-Disposition header's, else the ``filename`` query parameter, else
     "upload". It is sanitized like a form part's before anything sees it."""
-    media_type, _ = parse_content_type(request.headers.get("content-type"))
-    checked = _checked_media_type(media_type or None, constraints)
+    declared = request.headers.get("content-type", "").strip(" \t")
+    checked = _checked_media_type(declared or None, constraints)
     name = filename_from_disposition(request.headers.get("content-disposition"))
     return name or request.query_params.get("filename") or "upload", checked
 
