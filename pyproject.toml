@@ -75,8 +75,8 @@ dev = [
 build-constraint-dependencies = ["hatchling==1.32.0"]
 
 [project.urls]
-Repository = "https://github.com/imaadkhan-tz/mcp-upload"
-Issues = "https://github.com/imaadkhan-tz/mcp-upload/issues"
+Repository = "https://github.com/imaad786/mcp-upload"
+Issues = "https://github.com/imaad786/mcp-upload/issues"
 
 [tool.hatch.version]
 path = "src/mcp_upload/__init__.py"
