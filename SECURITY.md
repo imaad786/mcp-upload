@@ -41,7 +41,9 @@ Every defence in that table has a scenario in `stress/run.py` that attacks it ov
 sockets: header bombs, slow clients, bursts past the concurrency cap, replayed and
 racing tickets, mismatched digests, other owners, a gateway killed mid-upload, malformed
 and randomized multipart framing, and failing clients and backends in one mixed run. A
-nightly CI job runs them and checks their invariants.
+nightly CI job runs the ones that do not depend on timing and checks their invariants.
+The timing-based ones (slow clients, a gateway killed mid-upload, the connection pool
+ceiling) run in the before-and-after comparisons for each release.
 
 ## What it does not guarantee, and what a deployment must do
 

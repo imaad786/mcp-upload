@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.1 (2026-10-03)
+
+- **Fixed:** the upload page showed an empty progress bar before an upload started.
+  The bar's style set it visible, which overrode the attribute that hid it.
+- **Docs:** the README is now a short introduction with a diagram of both upload paths,
+  a recording of the upload page and a table of what was tested and how. The reference
+  material moved, unchanged in substance, into
+  [guide/](https://github.com/imaad786/mcp-upload/tree/main/guide). PyPI shows the
+  README from the package metadata, so it updates only with a release.
+
 ## 1.0.0 (2026-10-03)
 
 SEP-2631's `files/authorizeUpload`, a client, and a stability promise. The API is now

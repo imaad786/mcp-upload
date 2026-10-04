@@ -27,7 +27,7 @@ _STYLE = (
     "input[type=file]{display:block;margin:1rem 0}"
     "button{font:inherit;padding:.5rem 1rem}"
     "form.drop{outline:2px dashed #4a6fa5;outline-offset:.5rem}"
-    "progress{display:block;width:100%;margin:1rem 0}"
+    "progress{display:block;width:100%;margin:1rem 0}progress[hidden]{display:none}"
     "pre{white-space:pre-wrap;font-size:.85em}"
 )
 
