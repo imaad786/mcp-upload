@@ -21,9 +21,16 @@ from .resolve import FileReferenceError, resolve_file
 from .sinks import IncomingFile, Sink, UploadAborted
 from .store import MemoryStore, SqliteStore, Store, StoreFull
 from .tickets import ClaimError, Constraints, Outcome, Record, RedeemError, Status
-from .types import AwaitingUpload, FileDigest, FileTransferDescriptor, FileValue, UploadStatus
+from .types import (
+    AwaitingUpload,
+    FileDigest,
+    FileTransferDescriptor,
+    FileValue,
+    UploadStatus,
+    UploadTarget,
+)
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 __all__ = [
     "ERROR_STATUS",
@@ -53,6 +60,7 @@ __all__ = [
     "UploadError",
     "UploadGateway",
     "UploadStatus",
+    "UploadTarget",
     "__version__",
     "resolve_file",
 ]

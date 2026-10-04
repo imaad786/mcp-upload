@@ -629,3 +629,191 @@ async def test_the_wire_shape_over_streamable_http(
     posted = await uploads.post(upload["url"], content=form, headers={"Content-Type": content_type})
     assert posted.status_code == 200, posted.text
     assert (await resolve_file(gateway, file["uri"]))["digest"] == file["digest"]
+
+
+# ----- choosing a destination ----------------------------------------------------------
+
+
+def chooser(framework: str, gateway: UploadGateway, **ext: Any) -> Any:
+    """A server whose extension offers a choice of destinations, and no tools."""
+    if framework == "mcp":
+        from mcp.server.mcpserver import MCPServer
+
+        from mcp_upload.adapters.mcp_extension import UploadTicketExtension
+
+        return MCPServer("choose", extensions=[UploadTicketExtension(gateway, **ext)])
+    from fastmcp import FastMCP
+
+    from mcp_upload.adapters.fastmcp_extension import UploadTicketExtension as FastExt
+
+    fast = FastMCP("choose")
+    fast.add_extension(FastExt(gateway, **ext))
+    return fast
+
+
+@pytest.fixture
+async def three(upstream: Upstream, store: MemoryStore) -> AsyncIterator[UploadGateway]:
+    """A gateway with a third destination that is registered but never offered."""
+    registry = Registry(
+        Destination(name="files", url="http://backend.test/files/{id}", max_size=1000),
+        Destination(name="archive", url="http://backend.test/archive/{id}", max_size=10),
+        Destination(name="images", url="http://backend.test/i/{id}", accept=("image/*",)),
+        Destination(name="internal", url="http://backend.test/internal/{id}"),
+    )
+    http = httpx.AsyncClient(transport=httpx.MockTransport(upstream.handler))
+    gw = UploadGateway(base_url=BASE, registry=registry, store=store, server_name="test", http=http)
+    yield gw
+    await http.aclose()
+
+
+def test_offered_destinations_are_checked_and_advertised(three: UploadGateway) -> None:
+    from mcp_upload.adapters.mcp_extension import UploadTicketExtension
+
+    ext = UploadTicketExtension(three, destination="files", destinations=["archive", "images"])
+    assert ext.settings() == {
+        **OLD_SETTINGS,
+        "methods": ["files/authorizeUpload"],
+        "destinations": ["files", "archive", "images"],
+    }
+    # Without a list, settings are exactly as in 1.0.
+    assert "destinations" not in UploadTicketExtension(three, destination="files").settings()
+    with pytest.raises(UnknownDestination):
+        UploadTicketExtension(three, destination="files", destinations=["nowhere"])
+    with pytest.raises(TypeError):
+        UploadTicketExtension(three, destination="files", destinations="archive")
+    with pytest.raises(ValueError, match="need a gateway"):
+        UploadTicketExtension(destinations=["archive"])
+
+
+@pytest.mark.parametrize("framework", FRAMEWORKS)
+async def test_a_client_chooses_an_offered_destination(
+    framework: str, three: UploadGateway, upstream: Upstream
+) -> None:
+    server = chooser(framework, three, destination="files", destinations=["archive", "images"])
+    app = Starlette(routes=three.routes())
+    async with (
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE) as uploads,
+        connect(framework, server) as client,
+    ):
+        default = await upload_file(client, b"default", name="d.txt", http=uploads)
+        chosen = await upload_file(
+            client, b"archived", name="a.txt", http=uploads, destination="archive"
+        )
+        image = await authorize_upload(client, mime_type="image/png", destination="images")
+    urls = [str(r.url) for r in upstream.requests]
+    assert urls == [
+        f"http://backend.test/files/{default.rsplit('/', 1)[1]}",
+        f"http://backend.test/archive/{chosen.rsplit('/', 1)[1]}",
+    ]
+    record = await three._store.get(image["file"]["uri"].rsplit("/", 1)[1])
+    assert record is not None and record.destination == "images"
+
+
+@pytest.mark.parametrize("framework", FRAMEWORKS)
+@pytest.mark.parametrize(
+    ("offered", "requested", "allowed"),
+    [
+        (["archive"], "internal", ["files", "archive"]),
+        (["archive"], "http://evil.test/x", ["files", "archive"]),
+        (["archive"], 7, ["files", "archive"]),
+        ([], "archive", ["files"]),
+    ],
+)
+async def test_a_destination_not_offered_is_refused(
+    framework: str,
+    three: UploadGateway,
+    store: MemoryStore,
+    offered: list[str],
+    requested: Any,
+    allowed: list[str],
+) -> None:
+    from mcp_upload.adapters.sep2631 import (
+        IDENTIFIER,
+        AuthorizeUploadParams,
+        AuthorizeUploadRequest,
+        AuthorizeUploadResult,
+    )
+
+    server = chooser(framework, three, destination="files", destinations=offered)
+    meta: Any = {IDENTIFIER: {"destination": requested}}
+    request = AuthorizeUploadRequest(params=AuthorizeUploadParams(name="x", _meta=meta))
+    async with connect(framework, server) as client:
+        session = client.session
+        with pytest.raises(MCPError) as refused:
+            await session.send_request(request, AuthorizeUploadResult)
+    assert refused.value.code == -32602
+    assert refused.value.data == {"reason": "destinationNotAllowed", "allowed": allowed}
+    assert store._by_id == {}
+
+
+@pytest.mark.parametrize("framework", FRAMEWORKS)
+async def test_the_chosen_destination_sets_the_limits(framework: str, three: UploadGateway) -> None:
+    server = chooser(framework, three, destination="files", destinations=["archive"])
+    async with connect(framework, server) as client:
+        with pytest.raises(MCPError) as refused:
+            await authorize_upload(client, size=100, destination="archive")
+    assert refused.value.data == {"reason": "maxSizeExceeded", "maxSize": 10, "actualSize": 100}
+
+
+async def test_bearer_gateways_need_an_owner_to_authorize(upstream: Upstream) -> None:
+    from mcp.client.client import Client
+    from mcp.server.mcpserver import MCPServer
+
+    from mcp_upload.adapters.mcp_extension import UploadTicketExtension
+
+    async def anyone(request: Any) -> str | None:
+        return "someone"
+
+    gateway = UploadGateway(
+        base_url=BASE,
+        registry=Registry(Destination(name="files", url="http://backend.test/{id}")),
+        store=MemoryStore(),
+        authenticate=anyone,
+        ticket_in_url=False,
+    )
+    server = MCPServer("owners", extensions=[UploadTicketExtension(gateway, destination="files")])
+    async with Client(server) as client:
+        with pytest.raises(MCPError) as refused:
+            await authorize_upload(client, name="x")
+    assert refused.value.code == -32603
+    assert refused.value.data == {"reason": "ownerRequired"}
+
+
+async def test_upload_file_sends_the_bearer_token_when_asked(
+    upstream: Upstream, store: MemoryStore
+) -> None:
+    from mcp.client.client import Client
+    from mcp.server.mcpserver import MCPServer
+
+    from mcp_upload.adapters.mcp_extension import UploadTicketExtension
+
+    async def by_header(request: Any) -> str | None:
+        header = request.headers.get("authorization", "")
+        return "alice" if header == "Bearer alice-token" else None
+
+    gateway = UploadGateway(
+        base_url=BASE,
+        registry=Registry(Destination(name="files", url="http://backend.test/{id}")),
+        store=store,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(upstream.handler)),
+        authenticate=by_header,
+        ticket_in_url=False,
+    )
+    ext = UploadTicketExtension(gateway, destination="files", owner=lambda ctx: "alice")
+    server = MCPServer("bearer", extensions=[ext])
+    app = Starlette(routes=gateway.routes())
+    async with (
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE) as http,
+        Client(server) as client,
+    ):
+        authorized = await authorize_upload(client, name="b.txt")
+        assert authorized["upload"]["_meta"] == {"me.imaadkhan/upload-ticket": {"auth": "bearer"}}
+        with pytest.raises(UploadFailed) as refused:
+            await upload_file(client, b"no token", name="n.txt", http=http)
+        uri = await upload_file(
+            client, b"with token", name="b.txt", http=http, bearer="alice-token"
+        )
+    assert refused.value.status_code == 401
+    assert refused.value.error == "auth_required"
+    assert upstream.bodies == [b"with token"]
+    assert (await resolve_file(gateway, uri, owner="alice"))["size"] == len(b"with token")

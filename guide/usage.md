@@ -1,7 +1,8 @@
 # Using it
 
 How an upload flows, who sends the bytes, and every way a server can ask for a file,
-from a plain tool to SEP-2631's `files/authorizeUpload`. Back to the
+from a plain tool to SEP-2631's `files/authorizeUpload`, with or without a person
+present, and with or without a bearer token on the upload. Back to the
 [README](https://github.com/imaad786/mcp-upload/blob/main/README.md).
 
 Install first, with `pip install "mcp-upload[mcp]"` for the official SDK or
@@ -49,6 +50,7 @@ with the bytes can finish the job. What differs is who does it.
 | Claude Code, or any agent with a shell | The agent itself, with `curl -F file=@path <url>`. |
 | Claude.ai, Claude Desktop, ChatGPT, Cursor, VS Code | The person, by opening the URL. The page is a file picker and a button. |
 | A client that supports URL-mode elicitation | The client shows the link and asks for consent, through the two-round flow in [Asking through the client](#asking-through-the-client). |
+| A harness or scheduled agent with no person | It reads the upload target from the tool's `input_required` result and sends the bytes itself, as in [A harness with no person](#a-harness-with-no-person). |
 | Your own program | It posts the file, then asks the server what happened. |
 
 No host today acts on an upload request by itself, and none renders a native file
@@ -205,10 +207,166 @@ async def request_upload_interactive(ctx: Context) -> UploadStatus | InputRequir
 ```
 
 The first round mints the ticket and returns the elicitation. The retry reports the
-record's status, or `declined` or `cancelled` if the user refused. One ticket is
-minted across both rounds. This needs a client that supports URL-mode elicitation.
-The official SDK's `Client` does, most chat hosts do not yet, and the plain
-`request_upload` tool above works regardless.
+record: `completed` with the file's measured size and digest, why it failed, or
+`declined` or `cancelled` if the user refused. If the client retries before the upload
+has finished, the tool returns the same request again for the same ticket, so the
+client can keep asking until the file is in. Before 1.1.0 it returned `issued` there.
+One ticket is minted however many rounds it takes. This needs a client that supports
+URL-mode elicitation. The official SDK's `Client` does, most chat hosts do not yet,
+and the plain `request_upload` tool above works regardless.
+
+The ask can declare the file first, as `files/authorizeUpload` does:
+
+```python
+return await ask_for_upload(
+    ctx,
+    gateway,
+    "reports",
+    name="q3.pdf",
+    media_type="application/pdf",  # the only type the ticket accepts
+    expected_size=248123,  # exact, so other bytes are refused
+    expected_digest="uU0nuZNNPgilLlLX2n2r-sSE7-N6U4D6ZVe-_rYh2sU",
+)
+```
+
+`raw=True` describes a raw-body PUT instead of a form post, on a gateway built with
+`raw_uploads=True`. On FastMCP 4 the helper is the same function, imported from
+`mcp_upload.adapters.fastmcp`, and the tool takes FastMCP's `Context`.
+
+### A harness with no person
+
+A scheduled job or a headless agent has no one to click a link. It can still answer
+`ask_for_upload`, because the `input_required` result carries the whole upload target
+in its `_meta`, next to the URL meant for a person:
+
+```json
+{
+  "resultType": "input_required",
+  "inputRequests": {
+    "upload": {
+      "method": "elicitation/create",
+      "params": { "mode": "url", "message": "...", "url": "https://mcp.example.com/upload/..." }
+    }
+  },
+  "requestState": "...",
+  "_meta": {
+    "me.imaadkhan/upload-ticket": {
+      "targets": {
+        "upload": {
+          "file": { "uri": "mcp-file://example/up_...", "name": "q3.pdf", "size": 248123 },
+          "upload": { "transport": "https", "method": "POST", "url": "...", "multipart": { "fileField": "file" } }
+        }
+      }
+    }
+  }
+}
+```
+
+`targets` is keyed like `inputRequests`. Each target is the same `{file, upload}` pair
+that `files/authorizeUpload` returns, so code that handles one handles both. A client
+that knows nothing of this sees an ordinary URL elicitation. The target is on the
+result rather than on the elicitation because the 2026-07-28 schema gives URL
+elicitation params no `_meta`, and the official SDK drops unknown fields there.
+
+The harness sends the bytes and retries. `mcp_upload.client` has the pieces:
+
+```python
+from mcp_types import ElicitResult, InputRequiredResult
+from mcp_upload.client import send_file, upload_proof, upload_targets
+
+result = await client.session.call_tool("fetch_report", allow_input_required=True)
+while isinstance(result, InputRequiredResult):
+    answers = {}
+    for key, target in upload_targets(result).items():
+        stored = await send_file(target, "q3.pdf", bearer=access_token)
+        answers[key] = ElicitResult(action="accept", _meta=upload_proof(stored))
+    result = await client.session.call_tool(
+        "fetch_report",
+        input_responses=answers,
+        request_state=result.request_state,
+        allow_input_required=True,
+    )
+```
+
+`send_file` posts a form or a raw body, whichever the descriptor says, and returns
+the file as the server measured it. `upload_proof` puts that file's URI and digest in
+the answer's `_meta` under `me.imaadkhan/upload-ticket`, as `{"file": {"uri", "digest"}}`.
+The tool compares them with its record and returns `failed` with `proof_mismatch` if
+either differs. Proof is optional. Without it the record alone decides, and an answer
+that claims an upload the record does not show is simply asked again.
+
+### Requiring a bearer token
+
+By default the ticket in the URL is the only credential, which is what lets a person
+upload from a browser. Some deployments cannot accept a credential in a URL at all, and
+want every request, uploads included, to carry the same bearer token as their MCP
+requests. Give the gateway an authenticator built from the verifier the server already
+uses:
+
+```python
+from mcp_upload.adapters.mcp import ask_for_upload, authenticator, current_principal
+
+verifier = MyTokenVerifier()  # the SDK's TokenVerifier, also passed to MCPServer
+gateway = UploadGateway(
+    ...,
+    authenticate=authenticator(verifier),
+    ticket_in_url=False,  # the token is the only credential
+)
+
+
+@mcp.tool()
+async def fetch_report(ctx: Context) -> UploadStatus | InputRequiredResult:
+    return await ask_for_upload(ctx, gateway, "reports", owner=current_principal())
+```
+
+There are three modes:
+
+| `authenticate` | `ticket_in_url` | An upload needs |
+| --- | --- | --- |
+| not set | `True` (default) | The ticket in the URL, as before 1.1.0 |
+| set | `True` | The ticket and a valid token, whose principal must be the record's owner if it has one |
+| set | `False` | A valid token whose principal is the record's owner. The URL names the record by its id and carries no secret |
+
+- **The principal** is the token's client id, issuer and subject, the same parts the
+  official SDK uses to tell principals apart. `current_principal()` reads it from the
+  token on the tool call, and the authenticator reads it from the token on the upload,
+  so the two match only for the same user. If your verifier sets no subject, pass
+  `principal=` to both with a function that picks a user id claim.
+- **Refusals** happen before the ticket is spent and before the record is looked up.
+  No token is 401 with `WWW-Authenticate: Bearer` and `{"reason": "authRequired"}`. A
+  token the verifier refuses, or one past its expiry, is 401 `invalid_token`. Another
+  user's valid token is 403 `forbidden` with `{"reason": "ownerMismatch"}`.
+- **Single use still holds** with no secret in the URL. The URL is public and the
+  owner's token is reusable, so the gateway redeems through the hash the record
+  stores, in the same atomic step as a ticket. The test suite sends fifty concurrent
+  uploads to one record on each store and expects one winner, and CI runs the Redis
+  case against a real Redis.
+- **The browser page cannot send a header**, so with `authenticate` set a `GET` on the
+  upload URL explains that the program that asked for the file sends it, instead of
+  showing a form. This mode is for harnesses and programs, not for people.
+- **The descriptor says so.** Every `FileTransferDescriptor` from such a gateway
+  carries `"_meta": {"me.imaadkhan/upload-ticket": {"auth": "bearer"}}`, meaning send
+  the token you use for MCP requests to this server. No token is ever put in it.
+  `send_file(..., bearer=token)` and `upload_file(..., bearer=token)` send it.
+- **Without a token-checked owner nothing guards the upload**, so with
+  `ticket_in_url=False` every ticket must be issued with an `owner`. `issue` raises
+  without one, and `files/authorizeUpload` answers -32603 with
+  `{"reason": "ownerRequired"}`.
+
+On FastMCP 4, `authenticator(mcp)` uses the server's own auth provider and its
+required scopes, and `current_principal()` reads FastMCP's access token:
+
+```python
+from mcp_upload.adapters.fastmcp import authenticator, current_principal
+
+mcp = FastMCP("files", auth=provider)
+gateway = UploadGateway(..., authenticate=authenticator(mcp), ticket_in_url=False)
+```
+
+Any other scheme fits too. `authenticate` is any coroutine function that takes the
+Starlette request and returns a principal or `None`, and
+`mcp_upload.auth.bearer_authenticator` builds one from any object with
+`async verify_token(token)`.
 
 ### After an upload
 
@@ -292,8 +450,8 @@ mcp.add_extension(UploadTicketExtension(gateway, destination="reports", owner=us
 attach(mcp, gateway)
 ```
 
-- **`destination`** is where every authorized upload goes. The request carries no
-  destination and cannot pick one.
+- **`destination`** is where an authorized upload goes. By default the request
+  cannot pick another. See [Letting the client choose a destination](#letting-the-client-choose-a-destination).
 - **`owner`** maps the request to the user the ticket is bound to. It may be a plain
   function or a coroutine function. Without it, anyone who learns a file URI can
   read the file's name, size and digest.
@@ -357,7 +515,48 @@ Errors follow the proposal:
 | -32602 | `mimeType` outside the destination's list | `{"reason": "mimeTypeNotAccepted", "mimeType": "text/plain", "accept": ["image/*"]}` |
 | -32602 | A digest that is not base64url SHA-256 | `{"reason": "invalidDigest"}` |
 | -32602 | A negative size, or a malformed type | `{"reason": "invalidSize"}`, `{"reason": "invalidMimeType"}` |
+| -32602 | A destination the server does not offer | `{"reason": "destinationNotAllowed", "allowed": ["reports", "archive"]}` |
 | -32603 | The ticket store is full | `{"reason": "storeFull"}` |
+| -32603 | A bearer-only gateway and no owner for the request | `{"reason": "ownerRequired"}` |
+
+### Letting the client choose a destination
+
+Some backends need the final location of a file when the upload starts, and a client
+may have one to pick, such as a team folder or an archive. The extension can offer a
+closed list of destination names:
+
+```python
+UploadTicketExtension(
+    gateway,
+    destination="reports",  # used when the request names none
+    destinations=["archive", "legal"],  # names a client may choose instead
+    owner=user_of,
+)
+```
+
+SEP-2631's request has no destination field, so the client names one in the request's
+`_meta`, under the extension's identifier:
+
+```json
+{
+  "method": "files/authorizeUpload",
+  "params": {
+    "name": "q3.pdf",
+    "size": 248123,
+    "_meta": { "me.imaadkhan/upload-ticket": { "destination": "archive" } }
+  }
+}
+```
+
+`authorize_upload(..., destination="archive")` and `upload_file(..., destination=...)`
+send it. Any name outside the list, including one that is registered but not offered,
+is -32602 with `{"reason": "destinationNotAllowed", "allowed": ["reports", "archive",
+"legal"]}`, and no ticket is minted. The chosen destination's own size and type limits
+apply. The list is advertised at
+`capabilities.extensions["me.imaadkhan/upload-ticket"]["destinations"]`. A client only
+ever sends a name. It cannot supply a URL, host or path, and the registry stays the
+closed set the server author declared. Without `destinations`, naming anything but the
+default is refused, and the settings are exactly as before.
 
 **Discovery is not where SEP-2631 puts it.** The proposal has client and server
 declare a top-level `files` capability. The SDK's `ClientCapabilities` and

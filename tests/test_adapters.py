@@ -145,14 +145,15 @@ class CountingStore(MemoryStore):
 @pytest.mark.skipif(not HAS_OFFICIAL_SDK, reason="official SDK 2.x not installed")
 @pytest.mark.parametrize(
     ("action", "expected_status"),
-    [("accept", "issued"), ("decline", "declined"), ("cancel", "cancelled")],
+    [("decline", "declined"), ("cancel", "cancelled")],
 )
 async def test_official_sdk_two_round_elicitation(
     upstream: Upstream, action: Literal["accept", "decline", "cancel"], expected_status: str
 ) -> None:
     # The 2026-07-28 flow: the tool returns input_required with a URL-mode
     # elicitation, the client answers and retries, the tool runs again and reports.
-    # One ticket must be minted across both rounds.
+    # One ticket must be minted across both rounds. An accept before any upload is
+    # asked again, which tests/test_headless.py covers.
     from mcp.client.client import Client
 
     from mcp_upload.adapters.mcp import attach

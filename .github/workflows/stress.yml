@@ -35,7 +35,7 @@ jobs:
       # Throughput and slowloris are left out: they measure the machine, and slowloris
       # alone takes 90 s of wall time. Everything here has timing-free invariants.
       SCENARIOS: >-
-        header_bomb,header_bomb_under_load,epilogue_valid,epilogue_flood,burst_over_cap,policy_edges,digest_integrity,owner_isolation,claim_race,error_details,digest_format,filename_hygiene,chaos,store_backed_uploads,redis_two_replicas,sqlite_two_processes,on_complete_hook,sink_integrity,sink_mixed_failures,raw_uploads
+        header_bomb,header_bomb_under_load,epilogue_valid,epilogue_flood,burst_over_cap,policy_edges,digest_integrity,owner_isolation,claim_race,error_details,digest_format,filename_hygiene,chaos,store_backed_uploads,redis_two_replicas,sqlite_two_processes,on_complete_hook,sink_integrity,sink_mixed_failures,raw_uploads,bearer_auth,headless_flow,destination_choice
 
     steps:
       # Pinned to commits like ci.yml; Dependabot proposes bumps.

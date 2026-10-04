@@ -24,6 +24,12 @@ if sys.version_info >= (3, 12):
 else:
     from typing_extensions import TypedDict
 
+#: Reverse-DNS identifier for the pattern this library implements, per SEP-2133. The
+#: prefix is a domain Imaad owns and is not an MCP-organization namespace. It names the
+#: extension in server capabilities, and it is the key under which this library puts
+#: anything of its own into a ``_meta`` object.
+EXTENSION_ID = "me.imaadkhan/upload-ticket"
+
 
 class FileDigest(TypedDict):
     """``value`` is base64url without padding, as SEP-2631 specifies."""
@@ -46,12 +52,28 @@ class MultipartDescriptor(TypedDict):
 
 
 class FileTransferDescriptor(TypedDict):
+    """``_meta`` appears only on a gateway that authenticates uploads. Under
+    ``EXTENSION_ID`` it says how, for example ``{"auth": "bearer"}``: send the same
+    bearer token the client uses for MCP requests to this server. It never carries a
+    token."""
+
     transport: str
     method: str
     url: str
     headers: NotRequired[dict[str, str]]
     multipart: NotRequired[MultipartDescriptor]
     expiresAt: str
+    _meta: NotRequired[dict[str, Any]]
+
+
+class UploadTarget(TypedDict):
+    """Everything a program needs to send a file without a person: the file to be and
+    how to send its bytes. It is the result of ``files/authorizeUpload``, and what
+    ``ask_for_upload`` puts in its ``input_required`` result's ``_meta``, under
+    ``EXTENSION_ID`` and ``targets``."""
+
+    file: FileValue
+    upload: FileTransferDescriptor
 
 
 class AwaitingUpload(TypedDict):

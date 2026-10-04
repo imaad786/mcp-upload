@@ -13,10 +13,18 @@ The latest release on PyPI. Fixes are not backported.
 
 ## What the library guarantees
 
-The upload endpoint is protected by the ticket alone. That is safe because the ticket
-is 256 bits from the operating system's random source, stored only as its SHA-256,
-accepted exactly once (enforced atomically in the store), expiring in minutes, bound to
-one destination the server author registered, and useless for reading anything back.
+By default the upload endpoint is protected by the ticket alone. That is safe because
+the ticket is 256 bits from the operating system's random source, stored only as its
+SHA-256, accepted exactly once (enforced atomically in the store), expiring in minutes,
+bound to one destination the server author registered, and useless for reading
+anything back.
+
+A gateway built with `authenticate` also requires a bearer token, checked by the
+server author's verifier before the record is looked up or the ticket spent. With
+`ticket_in_url=False` the token is the only credential: the URL names the record by its
+public id, every record has an owner, only a token whose principal is that owner can
+upload, and single use is enforced by the same atomic redemption, through the hash the
+record stores.
 
 Beyond that, the library refuses requests that cannot carry a file before the ticket
 is touched, enforces the size limit on the bytes it receives rather than on the
@@ -31,24 +39,37 @@ Who can reach what, and what each of them can do:
 
 | Actor | Has | Can | Cannot |
 |---|---|---|---|
-| Anyone on the network | The endpoint URL | Fetch the upload page, send requests | Guess a ticket (256 bits), learn anything from refusals beyond an error code |
+| Anyone on the network | The endpoint URL | Fetch the upload page, send requests | Guess a ticket (256 bits), learn anything from refusals beyond an error code. With `authenticate` set, learn whether a ticket or record exists without a valid token |
 | Holder of a valid ticket, usually the user or an agent acting for them | One upload URL | Upload one file to the one destination the ticket names, within its size, type and digest limits | Upload twice, choose the destination, read any file back, hold a slot by sending slowly, exhaust memory with oversized part headers |
+| Holder of an upload URL in bearer-only mode, such as anyone who read a transcript | A record id | Nothing without the owner's token | Upload, since the URL carries no secret |
+| Another authenticated user, in either bearer mode | Their own valid token, and a URL or record id | Learn from a 403 that the record exists (ids are 72 random bits) | Upload to a record owned by someone else, spend its ticket |
+| Holder of the owner's token in bearer-only mode | The token and the record id | Upload one file to that record | Upload twice: fifty concurrent attempts have one winner |
 | A tool caller (often the model) | Tool arguments | Ask the server for a ticket, pass a file URI to a tool | Name a URL, host or path to stream into; use another owner's file when owners are set |
+| A client of `files/authorizeUpload` with `destinations` offered | Request `_meta` | Pick one of the destination names the server offers | Name any other destination, or a URL, host or path |
 | Another user of the same server | Record ids seen in transcripts | Nothing, when tickets carry an `owner` | Read another owner's status or claim their file |
 | The backend or a sink | The bytes it receives | Accept or refuse an upload | Have its response text echoed to the uploader |
 
 Every defence in that table has a scenario in `stress/run.py` that attacks it over real
 sockets: header bombs, slow clients, bursts past the concurrency cap, replayed and
 racing tickets, mismatched digests, other owners, a gateway killed mid-upload, malformed
-and randomized multipart framing, and failing clients and backends in one mixed run. A
-nightly CI job runs the ones that do not depend on timing and checks their invariants.
+and randomized multipart framing, and failing clients and backends in one mixed run.
+The bearer modes have their own: missing, forged and other users' tokens, bearer-only
+replay races on the memory and SQLite stores and on Redis when one is reachable,
+headless flows against a real MCP server process, and destinations a client was not
+offered. A nightly CI job runs the ones that do not depend on timing and checks their
+invariants.
 The timing-based ones (slow clients, a gateway killed mid-upload, the connection pool
 ceiling) run in the before-and-after comparisons for each release.
 
 ## What it does not guarantee, and what a deployment must do
 
-- **Transport security.** The ticket travels in the URL. Serve the endpoint over TLS
-  only. Set `base_url` to an `https` origin.
+- **Transport security.** The ticket travels in the URL, and in bearer modes a token
+  travels in a header. Serve the endpoint over TLS only. Set `base_url` to an `https`
+  origin.
+- **The token verifier.** In bearer modes the gateway trusts what `authenticate`
+  returns. Build it from the same verifier and required scopes that guard the MCP
+  route. A verifier that sets no subject makes every user of one OAuth client the same
+  principal, unless you pass a `principal` function that tells them apart.
 - **Rate limiting.** The library caps concurrent uploads per process with
   `max_in_flight` (100 by default) and refuses beyond it with 503. Per-client rate
   limiting, a cap across processes and request-size limits at the reverse proxy are
@@ -66,9 +87,10 @@ ceiling) run in the before-and-after comparisons for each release.
 - **Resources.** Each process streams at most `max_in_flight` uploads at once, refuses
   a body with more than 512 KiB that is not file data, and cuts off clients that stall
   or run past `upload_timeout`. Limits across processes belong at your proxy.
-- **Logs.** The library logs record ids and outcome codes and never the ticket. Your
-  access logs will contain the ticket URL. Scrub the path or accept that a leaked log
-  yields tickets that expire in fifteen minutes and work once.
+- **Logs.** The library logs record ids and outcome codes and never the ticket or a
+  token. Your access logs will contain the ticket URL. Scrub the path or accept that a
+  leaked log yields tickets that expire in fifteen minutes and work once. In bearer-only
+  mode the URL holds no secret. Keep `Authorization` out of your logs.
 
 ## Supply chain
 

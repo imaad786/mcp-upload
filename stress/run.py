@@ -19,6 +19,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import hmac
 import json
 import os
 import random
@@ -1784,6 +1785,581 @@ async def raw_uploads(src: str) -> dict[str, Any]:
             "completed_but_wrong_or_missing_bytes": results_wrong_bytes(list(results), commits),
             "failed_but_committed": failed_but_kept(list(results), commits),
             "backend_commits": len(commits),
+        },
+    )
+
+
+# ----- bearer tokens, headless uploads and destination choice (1.1.0) --------------------
+
+# The stress gateway's and stress MCP server's token format, ``tok.<user>.<mac>``. The
+# harness mints tokens itself rather than importing them, so it never imports the
+# library under test.
+TOKEN_KEY = b"stress-harness-token-key"
+EXT = "me.imaadkhan/upload-ticket"
+
+
+def token_for(user: str) -> str:
+    mac = hmac.new(TOKEN_KEY, user.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"tok.{user}.{mac}"
+
+
+def forged(user: str) -> str:
+    """A token for ``user`` with its last character changed, so its MAC fails."""
+    good = token_for(user)
+    return good[:-1] + ("0" if good[-1] != "0" else "1")
+
+
+async def send_as(stack: Stack, ticket: dict[str, Any], body: Body, token: str | None) -> Reply:
+    headers = dict(CT)
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    reply = await http_rc(stack.gateway_port, "POST", ticket["path"], headers=headers, body=body)
+    reply.body.setdefault("id", ticket.get("id"))
+    return reply
+
+
+async def bearer_mode(src: str, mode: str, store_args: dict[str, Any]) -> dict[str, Any]:
+    """One gateway in ``mode`` (ticket_bearer or bearer): 100 honest uploads by ten
+    owners with their own tokens, then 30 refusals (10 with no token, 10 with a forged
+    one, 10 with another user's valid token), each followed by the owner uploading to
+    the same ticket, then 10 records each hit by 50 concurrent uploads with the owner's
+    token."""
+    stack = start(src, auth=mode, max_in_flight=1024, **store_args)
+    caps = await capabilities(stack)
+    if missing := lacking(caps, "authenticate"):
+        return unsupported(stack, missing)
+    if caps.get("auth_mode") != mode:
+        return unsupported(stack, [f"auth_mode {mode}"])
+    rng = random.Random(41)
+    users = [f"user{i}" for i in range(10)]
+
+    tickets = list(
+        await asyncio.gather(*(issue_rc(stack, owner=users[i % 10]) for i in range(100)))
+    )
+    bodies = [
+        file_body(rng.randint(1, 256 * 1024), chunk=64 * 1024, seed=5000 + i) for i in range(100)
+    ]
+    honest = await asyncio.gather(
+        *(send_as(stack, t, bodies[i][0], token_for(users[i % 10])) for i, t in enumerate(tickets))
+    )
+    url_has_secret = sum(not t["path"].rsplit("/", 1)[1].startswith("up_") for t in tickets)
+
+    kinds = [("missing", None), ("invalid", forged("alice")), ("other_owner", token_for("bob"))]
+    refused_tickets = [
+        (kind, token, await issue_rc(stack, owner="alice"))
+        for kind, token in kinds
+        for _ in range(10)
+    ]
+    refused = await asyncio.gather(
+        *(
+            send_as(stack, t, file_body(4096, seed=6000 + i)[0], token)
+            for i, (_, token, t) in enumerate(refused_tickets)
+        )
+    )
+    after = [await status_rc(stack, t["id"]) for _, _, t in refused_tickets]
+    commits_before = (await backend(stack))["commits"]
+    refused_but_committed = sum(t["id"] in commits_before for _, _, t in refused_tickets)
+    owner_bodies = [file_body(32 * 1024, seed=7000 + i) for i in range(len(refused_tickets))]
+    owner_after = await asyncio.gather(
+        *(
+            send_as(stack, t, owner_bodies[i][0], token_for("alice"))
+            for i, (_, _, t) in enumerate(refused_tickets)
+        )
+    )
+
+    race_tickets = [await issue_rc(stack, owner="alice") for _ in range(10)]
+    winners: Counter[str] = Counter()
+    race_http: Counter[str] = Counter()
+    for i, t in enumerate(race_tickets):
+        body, _ = file_body(16 * 1024, seed=8000 + i)
+        replies = await asyncio.gather(
+            *(send_as(stack, t, body, token_for("alice")) for _ in range(50))
+        )
+        winners[str(sum(r.status == 200 for r in replies))] += 1
+        race_http.update(str(r.status or r.error) for r in replies)
+
+    await asyncio.sleep(0.5)
+    commits = (await backend(stack))["commits"]
+    by_kind_http: dict[str, Counter[str]] = {}
+    by_kind_error: dict[str, Counter[str]] = {}
+    by_kind_after: dict[str, Counter[str]] = {}
+    for (kind, _, _), reply, status in zip(refused_tickets, refused, after, strict=True):
+        by_kind_http.setdefault(kind, Counter())[str(reply.status)] += 1
+        by_kind_error.setdefault(kind, Counter())[
+            reply.body.get("error") or reply.body.get("status") or reply.error or "?"
+        ] += 1
+        by_kind_after.setdefault(kind, Counter())[str(status.get("status"))] += 1
+    return finish(
+        stack,
+        {
+            "mode": mode,
+            "store": caps.get("store"),
+            "honest_outcomes": outcomes(list(honest)),
+            "completed_but_wrong_or_missing_bytes": wrong_bytes(
+                list(honest), [d for _, d in bodies], commits
+            ),
+            "urls_with_a_secret": url_has_secret,
+            "refusal_http_by_kind": {k: dict(v) for k, v in by_kind_http.items()},
+            "refusal_outcomes_by_kind": {k: dict(v) for k, v in by_kind_error.items()},
+            "record_after_refusal_by_kind": {k: dict(v) for k, v in by_kind_after.items()},
+            "refused_but_committed": refused_but_committed,
+            "owner_after_refusal_outcomes": outcomes(list(owner_after)),
+            "owner_after_refusal_wrong_bytes": wrong_bytes(
+                list(owner_after), [d for _, d in owner_bodies], commits
+            ),
+            "race_tickets_by_winner_count": dict(winners),
+            "race_http": dict(race_http),
+        },
+    )
+
+
+async def bearer_race(src: str, store_args: dict[str, Any]) -> dict[str, Any]:
+    """Bearer-only, on one store: 20 records, each hit by 50 concurrent uploads carrying
+    the owner's token. The URL holds no secret, so single use rests on the store."""
+    stack = start(src, auth="bearer", max_in_flight=1024, **store_args)
+    caps = await capabilities(stack)
+    if missing := lacking(caps, "authenticate"):
+        return unsupported(stack, missing)
+    winners: Counter[str] = Counter()
+    race_http: Counter[str] = Counter()
+    digests: dict[str, str] = {}
+    for i in range(20):
+        t = await issue_rc(stack, owner="alice")
+        body, digest = file_body(16 * 1024, seed=9000 + i)
+        digests[t["id"]] = digest
+        replies = await asyncio.gather(
+            *(send_as(stack, t, body, token_for("alice")) for _ in range(50))
+        )
+        winners[str(sum(r.status == 200 for r in replies))] += 1
+        race_http.update(str(r.status or r.error) for r in replies)
+    await asyncio.sleep(0.5)
+    commits = (await backend(stack))["commits"]
+    return finish(
+        stack,
+        {
+            "store": caps.get("store"),
+            "race_tickets_by_winner_count": dict(winners),
+            "race_http": dict(race_http),
+            "race_integrity_violations": sum(
+                commits.get(rid, {}).get("sha256") != d for rid, d in digests.items()
+            ),
+        },
+    )
+
+
+def redis_reachable() -> bool:
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(REDIS_URL)
+    with socket.socket() as sock:
+        sock.settimeout(1)
+        return sock.connect_ex((parts.hostname or "localhost", parts.port or 6379)) == 0
+
+
+@scenario
+async def bearer_auth(src: str) -> dict[str, Any]:
+    """Bearer tokens on the upload endpoint. With the ticket and a token, and with the
+    token alone: honest uploads complete, every missing, forged or other user's token
+    is refused before the ticket is spent and nothing is committed, and the owner can
+    still use the ticket afterwards. Then bearer-only replay races, 50 at once per
+    record, on the memory, SQLite and Redis stores (Redis when one is reachable)."""
+    first = await bearer_mode(src, "ticket_bearer", {})
+    if first.get("supported") is False:
+        return first
+    result: dict[str, Any] = {"supported": True, "ticket_bearer": first}
+    result["bearer"] = await bearer_mode(src, "bearer", {})
+    result["bearer_race_sqlite"] = await bearer_race(
+        src, {"store": "sqlite", "db": os.path.join(tempfile.mkdtemp(), "tickets.db")}
+    )
+    if redis_reachable():
+        prefix = redis_prefix("bearer")
+        try:
+            result["bearer_race_redis"] = await bearer_race(src, redis_args(prefix))
+        finally:
+            redis_cleanup(prefix)
+    else:
+        result["bearer_race_redis"] = {"skipped": f"nothing listens at {REDIS_URL}"}
+    return result
+
+
+def start_mcp(src: str, auth: str) -> Stack:
+    """The stress backend and an MCP server process (``mcp_server.py``) in front of it."""
+    env = {**os.environ, "PYTHONPATH": src}
+    bport = free_port()
+    backend_proc = subprocess.Popen([sys.executable, str(HERE / "backend.py"), str(bport)], env=env)
+    wait_port(bport)
+    mport = free_port()
+    server = subprocess.Popen(
+        [
+            sys.executable,
+            str(HERE / "mcp_server.py"),
+            "--port",
+            str(mport),
+            "--backend",
+            f"http://127.0.0.1:{bport}",
+            "--auth",
+            auth,
+        ],
+        env=env,
+    )
+    try:
+        wait_port(mport, timeout=30)
+    except RuntimeError:
+        for proc in (server, backend_proc):
+            proc.kill()
+        raise
+    watch = RssWatch(server)
+    watch.base_mb = watch.sample()
+    watch.start()
+    return Stack(mport, bport, server, backend_proc, watch)
+
+
+def b64_sha256(data: bytes) -> str:
+    return base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+
+
+class Flows:
+    """Counts passes and failures per kind of flow, with the first few errors."""
+
+    def __init__(self) -> None:
+        self.results: dict[str, dict[str, Any]] = {}
+
+    async def run(self, kind: str, flow: Awaitable[None]) -> None:
+        entry = self.results.setdefault(kind, {"flows": 0, "passed": 0, "failed": 0, "errors": []})
+        entry["flows"] += 1
+        try:
+            await flow
+            entry["passed"] += 1
+        except Exception as exc:
+            entry["failed"] += 1
+            if len(entry["errors"]) < 3:
+                entry["errors"].append(f"{type(exc).__name__}: {exc}"[:300])
+
+    def report(self) -> dict[str, dict[str, Any]]:
+        for entry in self.results.values():
+            if not entry["errors"]:
+                del entry["errors"]
+        return self.results
+
+
+@contextlib.asynccontextmanager
+async def mcp_session(port: int, user: str) -> AsyncIterator[Any]:
+    """An official SDK client session to the stress MCP server, as ``user``."""
+    from mcp.client import Client
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.shared._httpx_utils import create_mcp_http_client
+
+    http_client = create_mcp_http_client(headers={"Authorization": f"Bearer {token_for(user)}"})
+    async with (
+        http_client,
+        Client(
+            streamable_http_client(f"http://127.0.0.1:{port}/mcp", http_client=http_client)
+        ) as client,
+    ):
+        yield client.session
+
+
+async def put_bytes(
+    uploads: Any, target: dict[str, Any], data: bytes, token: str | None
+) -> tuple[int, dict[str, Any]]:
+    """Send ``data`` as the target's descriptor says, the way a harness would, with no
+    help from the library: a form post for a multipart descriptor, else a raw body."""
+    upload = target["upload"]
+    headers = {"Accept": "application/json", **(upload.get("headers") or {})}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    if "multipart" in upload:
+        field = upload["multipart"].get("fileField", "file")
+        response = await uploads.request(
+            upload["method"], upload["url"], headers=headers, files={field: ("report.bin", data)}
+        )
+    else:
+        response = await uploads.request(
+            upload["method"], upload["url"], headers=headers, content=data
+        )
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+    return response.status_code, body if isinstance(body, dict) else {}
+
+
+def target_in(result: Any) -> dict[str, Any]:
+    meta = getattr(result, "meta", None) or {}
+    target: dict[str, Any] = meta[EXT]["targets"]["upload"]
+    return target
+
+
+@scenario
+async def headless_flow(src: str) -> dict[str, Any]:
+    """A real MCP server process with a tool that asks for a file through
+    ``ask_for_upload``, guarded by a bearer token, and the official SDK client acting as
+    a harness with no person: call the tool, read the upload target from the
+    input_required result's ``_meta``, send the bytes with the same bearer token, retry
+    with proof, and get the typed completed record. 50 such flows run at once with the
+    other kinds: an early retry before uploading, a proof whose digest is wrong, and
+    uploads with no token or another user's token before the right one. Bearer-only
+    gateway. The backend's commits are checked against the bytes sent."""
+    stack = start_mcp(src, "bearer")
+    caps = await get_json(stack.gateway_port, "/_caps")
+    if missing := [n for n in ("ask_target", "authenticate") if not caps.get(n)]:
+        return unsupported(stack, missing)
+
+    import httpx
+    from mcp_types import ElicitResult, InputRequiredResult
+
+    flows = Flows()
+    sent: dict[str, str] = {}  # record id -> sha256 hex of the bytes that must commit
+    rng = random.Random(29)
+    port = stack.gateway_port
+    timings: list[float] = []
+
+    def proof(file: dict[str, Any]) -> dict[str, Any]:
+        return {EXT: {"file": {"uri": file["uri"], "digest": file["digest"]}}}
+
+    async def start_call(session: Any, data: bytes) -> InputRequiredResult:
+        first = await session.call_tool(
+            "fetch_report",
+            {"size": len(data), "digest": b64_sha256(data)},
+            allow_input_required=True,
+        )
+        assert isinstance(first, InputRequiredResult), f"expected input_required, got {first}"
+        return first
+
+    async def retry(
+        session: Any, data: bytes, state: str | None, meta: dict[str, Any] | None = None
+    ) -> Any:
+        return await session.call_tool(
+            "fetch_report",
+            {"size": len(data), "digest": b64_sha256(data)},
+            input_responses={"upload": ElicitResult(action="accept", _meta=meta)},
+            request_state=state,
+            allow_input_required=True,
+        )
+
+    def completed(result: Any, data: bytes) -> dict[str, Any]:
+        assert not isinstance(result, InputRequiredResult), "still input_required"
+        status = result.structured_content
+        assert status["status"] == "completed", status
+        file = status["file"]
+        assert file["digest"] == {"algorithm": "sha-256", "value": b64_sha256(data)}, file
+        assert file["size"] == len(data), file
+        return dict(file)
+
+    async def good(i: int, uploads: Any) -> None:
+        t0 = time.perf_counter()
+        data = rng.randbytes(rng.randint(1024, 256 * 1024))
+        async with mcp_session(port, f"good{i}") as session:
+            first = await start_call(session, data)
+            target = target_in(first)
+            assert target["file"]["size"] == len(data)
+            assert target["file"]["digest"]["value"] == b64_sha256(data)
+            assert target["upload"]["_meta"] == {EXT: {"auth": "bearer"}}
+            assert "." not in target["upload"]["url"].rsplit("/", 1)[1]
+            code, body = await put_bytes(uploads, target, data, token_for(f"good{i}"))
+            assert code == 200, (code, body)
+            file = completed(
+                await retry(session, data, first.request_state, proof(body["file"])), data
+            )
+        sent[file["uri"].rsplit("/", 1)[1]] = hashlib.sha256(data).hexdigest()
+        timings.append(time.perf_counter() - t0)
+
+    async def early(i: int, uploads: Any) -> None:
+        data = rng.randbytes(8192)
+        async with mcp_session(port, f"early{i}") as session:
+            first = await start_call(session, data)
+            target = target_in(first)
+            again = await retry(session, data, first.request_state)
+            assert isinstance(again, InputRequiredResult), f"early retry got {again}"
+            assert target_in(again) == target, "asked again for a different upload"
+            code, body = await put_bytes(uploads, target, data, token_for(f"early{i}"))
+            assert code == 200, (code, body)
+            file = completed(await retry(session, data, again.request_state), data)
+        sent[file["uri"].rsplit("/", 1)[1]] = hashlib.sha256(data).hexdigest()
+
+    async def mismatch(i: int, uploads: Any) -> None:
+        data = rng.randbytes(4096)
+        async with mcp_session(port, f"liar{i}") as session:
+            first = await start_call(session, data)
+            target = target_in(first)
+            code, body = await put_bytes(uploads, target, data, token_for(f"liar{i}"))
+            assert code == 200, (code, body)
+            lie = {
+                "uri": body["file"]["uri"],
+                "digest": {"algorithm": "sha-256", "value": b64_sha256(b"other")},
+            }
+            result = await retry(session, data, first.request_state, {EXT: {"file": lie}})
+        status = result.structured_content
+        assert status["status"] == "failed" and status["error"] == "proof_mismatch", status
+        assert "file" not in status, status
+        sent[body["file"]["uri"].rsplit("/", 1)[1]] = hashlib.sha256(data).hexdigest()
+
+    async def wrong_token(i: int, uploads: Any) -> None:
+        data = rng.randbytes(4096)
+        user = f"owner{i}"
+        async with mcp_session(port, user) as session:
+            first = await start_call(session, data)
+            target = target_in(first)
+            for token, expected in ((None, 401), (forged(user), 401), (token_for("mallory"), 403)):
+                code, body = await put_bytes(uploads, target, data, token)
+                assert code == expected, (token, code, body)
+            still = await retry(session, data, first.request_state)
+            assert isinstance(still, InputRequiredResult), "a refused upload spent the ticket"
+            code, body = await put_bytes(uploads, target, data, token_for(user))
+            assert code == 200, (code, body)
+            file = completed(
+                await retry(session, data, still.request_state, proof(body["file"])), data
+            )
+        sent[file["uri"].rsplit("/", 1)[1]] = hashlib.sha256(data).hexdigest()
+
+    gate = asyncio.Semaphore(50)
+    async with httpx.AsyncClient(limits=httpx.Limits(max_connections=100), timeout=60.0) as uploads:
+
+        async def one(kind: str, flow: Callable[[int, Any], Awaitable[None]], i: int) -> None:
+            async with gate:
+                await flows.run(kind, flow(i, uploads))
+
+        jobs = [one("good", good, i) for i in range(50)]
+        jobs += [
+            one(kind, flow, i)
+            for kind, flow in (
+                ("early_retry", early),
+                ("proof_mismatch", mismatch),
+                ("wrong_token", wrong_token),
+            )
+            for i in range(10)
+        ]
+        random.Random(3).shuffle(jobs)
+        t0 = time.perf_counter()
+        await asyncio.gather(*jobs)
+        wall = time.perf_counter() - t0
+
+    await asyncio.sleep(0.5)
+    stats = await backend(stack)
+    commits: dict[str, Any] = stats["commits"]
+    matching = sum(commits.get(rid, {}).get("sha256") == sha for rid, sha in sent.items())
+    return finish(
+        stack,
+        {
+            "supported": True,
+            "flows": flows.report(),
+            "concurrency": 50,
+            "wall_s": round(wall, 2),
+            "good_flow_p50_ms": round(statistics.median(timings) * 1000, 1) if timings else None,
+            "backend_commits": len(commits),
+            "expected_commits": len(sent),
+            "commits_matching_sent_sha256": matching,
+        },
+    )
+
+
+def authorize_models() -> tuple[Any, Any, Any]:
+    """``files/authorizeUpload`` as the harness's own wire models, so the harness does
+    not use the library's client to test the library's server."""
+    from typing import Literal
+
+    from mcp_types import Request, RequestParams, Result
+
+    class Params(RequestParams):
+        name: str | None = None
+        size: int | None = None
+        digest: dict[str, str] | None = None
+
+    class AuthorizeRequest(Request[Params, Literal["files/authorizeUpload"]]):
+        method: Literal["files/authorizeUpload"] = "files/authorizeUpload"
+
+    class AuthorizeResult(Result):
+        file: dict[str, Any]
+        upload: dict[str, Any]
+
+    return Params, AuthorizeRequest, AuthorizeResult
+
+
+@scenario
+async def destination_choice(src: str) -> dict[str, Any]:
+    """``files/authorizeUpload`` with a destination named in ``_meta``, against a real MCP
+    server process whose extension offers ``archive`` besides the default ``files``,
+    with ``internal`` registered but not offered. At once: 20 flows naming no
+    destination, 20 naming ``archive``, 10 naming ``internal`` and 5 naming a URL. The
+    first two must land where they asked (the backend key says which destination), the
+    rest must be refused with -32602 ``destinationNotAllowed`` and mint nothing."""
+    stack = start_mcp(src, "bearer")
+    caps = await get_json(stack.gateway_port, "/_caps")
+    if missing := [n for n in ("destinations", "authenticate") if not caps.get(n)]:
+        return unsupported(stack, missing)
+
+    import httpx
+    from mcp.shared.exceptions import MCPError
+
+    Params, AuthorizeRequest, AuthorizeResult = authorize_models()
+    flows = Flows()
+    landed: dict[str, tuple[str, str]] = {}  # record id -> (expected backend key, sha256)
+    port = stack.gateway_port
+    rng = random.Random(31)
+
+    async def authorize(session: Any, data: bytes, destination: str | None) -> Any:
+        meta = None if destination is None else {EXT: {"destination": destination}}
+        params = Params(
+            name="d.bin",
+            size=len(data),
+            digest={"algorithm": "sha-256", "value": b64_sha256(data)},
+            _meta=meta,
+        )
+        return await session.send_request(AuthorizeRequest(params=params), AuthorizeResult)
+
+    async def chooses(i: int, uploads: Any, destination: str | None) -> None:
+        data = rng.randbytes(rng.randint(1, 64 * 1024))
+        user = f"chooser{destination}{i}"
+        async with mcp_session(port, user) as session:
+            authorized = await authorize(session, data, destination)
+        code, body = await put_bytes(uploads, authorized.model_dump(), data, token_for(user))
+        assert code == 200, (code, body)
+        record_id = authorized.file["uri"].rsplit("/", 1)[1]
+        key = record_id if destination is None else f"{destination}-{record_id}"
+        landed[record_id] = (key, hashlib.sha256(data).hexdigest())
+
+    async def refused(i: int, uploads: Any, destination: str) -> None:
+        data = rng.randbytes(1024)
+        async with mcp_session(port, f"refused{i}") as session:
+            try:
+                await authorize(session, data, destination)
+            except MCPError as exc:
+                assert exc.code == -32602, exc.code
+                assert exc.data == {
+                    "reason": "destinationNotAllowed",
+                    "allowed": ["files", "archive"],
+                }, exc.data
+            else:
+                raise AssertionError(f"{destination!r} was authorized")
+
+    gate = asyncio.Semaphore(50)
+    async with httpx.AsyncClient(limits=httpx.Limits(max_connections=100), timeout=60.0) as uploads:
+
+        async def one(kind: str, flow: Awaitable[None]) -> None:
+            async with gate:
+                await flows.run(kind, flow)
+
+        jobs = [one("default", chooses(i, uploads, None)) for i in range(20)]
+        jobs += [one("archive", chooses(i, uploads, "archive")) for i in range(20)]
+        jobs += [one("not_offered", refused(i, uploads, "internal")) for i in range(10)]
+        jobs += [one("url", refused(i, uploads, "http://127.0.0.1:9/steal")) for i in range(5)]
+        random.Random(5).shuffle(jobs)
+        await asyncio.gather(*jobs)
+
+    await asyncio.sleep(0.5)
+    commits: dict[str, Any] = (await backend(stack))["commits"]
+    wrong_place = sum(commits.get(key, {}).get("sha256") != sha for key, sha in landed.values())
+    return finish(
+        stack,
+        {
+            "supported": True,
+            "flows": flows.report(),
+            "backend_commits": len(commits),
+            "expected_commits": len(landed),
+            "landed_elsewhere_or_wrong_bytes": wrong_place,
+            "commits_to_destinations_not_offered": sum(
+                not (k.startswith("up_") or k.startswith("archive-up_")) for k in commits
+            ),
         },
     )
 

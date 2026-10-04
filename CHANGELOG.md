@@ -1,5 +1,69 @@
 # Changelog
 
+## 1.1.0 (2026-10-04)
+
+Three features for the pattern the MCP Files Working Group is converging on, where a
+tool returns an upload target and the client moves the bytes. An existing server
+behaves as on 1.0.2 unless it opts in, with one fix to `ask_for_upload` noted below.
+
+- **Bearer tokens on the upload endpoint.** `UploadGateway(authenticate=...)` checks a
+  credential on every upload, before the record is looked up or the ticket spent. No
+  token is 401 with `WWW-Authenticate: Bearer`, a refused or expired one is 401
+  `invalid_token`, and another user's is 403 `forbidden`, each with a `reason` in
+  `details`. With `ticket_in_url=False` the token is the only credential: the URL
+  names the record by its id, every ticket needs an `owner`, and single use is enforced
+  by the same atomic redemption through the hash the record stores, in all three
+  stores. `mcp_upload.auth.bearer_authenticator` builds an authenticator from any
+  `verify_token` verifier. `authenticator()` and `current_principal()` in both
+  adapters tie it to the official SDK's `TokenVerifier` or FastMCP's auth provider, so
+  an upload needs the same token as a tool call. Descriptors from such a gateway carry
+  `"_meta": {"me.imaadkhan/upload-ticket": {"auth": "bearer"}}` and never a token. The
+  upload page explains that a program sends the file instead of showing a form.
+- **A machine-readable target for harnesses.** `ask_for_upload` still returns a
+  URL-mode elicitation for a person, and its `input_required` result now also carries
+  `{"me.imaadkhan/upload-ticket": {"targets": {"upload": {file, upload}}}}` in `_meta`,
+  the same pair `files/authorizeUpload` returns. It sits on the result because the
+  2026-07-28 schema gives URL elicitation params no `_meta`, and the official SDK drops
+  it there. `ask_for_upload` takes `name`, `media_type`, `expected_size`,
+  `expected_digest` and `raw` to declare the file first. An answer may prove the upload
+  with the file's URI and digest in the `ElicitResult`'s `_meta`, and a mismatch returns
+  `failed` with `proof_mismatch`. The same helper is now in
+  `mcp_upload.adapters.fastmcp`. `mcp_upload.client` adds `upload_targets`,
+  `send_file` and `upload_proof`, and `upload_file` takes `bearer` and `destination`.
+- **Destination choice on `files/authorizeUpload`.**
+  `UploadTicketExtension(..., destinations=[...])` lets a client name one of the listed
+  destinations in the request's `_meta`. Any other name, a URL included, is -32602 with
+  `{"reason": "destinationNotAllowed", "allowed": [...]}` and mints nothing. The list
+  is advertised in the extension's settings. Without it, settings are unchanged.
+- **Fixed:** a client that retried `ask_for_upload` before the upload finished got
+  status `issued` and nothing to act on. It now gets the same request again for the
+  same ticket. The request state carries the ticket for that, checked against the
+  stored hash before use. Both frameworks seal request state with AES-GCM by default.
+- **Also new:** `UploadGateway.resume`, the `authenticates` and `ticket_in_url`
+  properties, the `UploadTarget` type, error codes `auth_required`, `invalid_token` and
+  `forbidden`, and -32603 `ownerRequired` when a bearer-only gateway has no owner for
+  an authorize request.
+
+Live, with three new scenarios in `stress/run.py`. `bearer_auth`, in both bearer modes:
+100 of 100 uploads with the owners' tokens completed with the right bytes, and 30
+uploads with no token, a forged token or another user's token were refused before the
+ticket was spent, with nothing committed, after which the owner completed all 30.
+Bearer-only replay races of 50 concurrent uploads per record had one winner each, on
+10 records in the memory store and 20 in SQLite. `headless_flow`, a real MCP server
+process driven by the official SDK client as a harness with the same bearer token, 50
+at once: 50 of 50 good flows, 10 of 10 early retries asked again, 10 of 10 wrong proofs
+refused, 10 of 10 wrong tokens refused before the right one completed, and 80 of 80
+backend commits matching the bytes sent. `destination_choice`: 40 of 40 uploads landed
+in the destination asked for, and 15 of 15 requests for a destination not offered or a
+URL were refused. Redis was not available for these runs, so the Redis race ran only on
+fakeredis in the test suite.
+
+Against 1.0.2 on the same harness, the full suite (Redis scenarios not run) and 3,000
+fuzzed multipart bodies hold every invariant, the SEP-2631 flows pass 90 of 90 on
+both versions (and on FastMCP for 1.1.0), and medians of three alternating throughput runs are unchanged: one 1 GiB
+upload 886 and 880 MiB/s, 200 concurrent 735 and 739 MiB/s, one 512 MiB upload in
+16 KiB frames 708 and 711 MiB/s.
+
 ## 1.0.2 (2026-10-04)
 
 Two interop fixes, found by driving an independent SEP-2631 gateway, waygate 1.1.0,

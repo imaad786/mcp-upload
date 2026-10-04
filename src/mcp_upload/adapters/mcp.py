@@ -1,29 +1,21 @@
 """Adapter for the official MCP Python SDK (the ``mcp`` package, 2.x).
 
-Two things live here. ``attach`` registers the upload endpoint on an ``MCPServer``.
-``ask_for_upload`` drives the multi-round-trip flow the 2026-07-28 protocol uses in
-place of server-initiated requests, so a tool can hand the user to the upload page
-through URL-mode elicitation instead of printing a link in prose.
+``attach`` registers the upload endpoint on an ``MCPServer``. ``ask_for_upload``
+drives the multi-round-trip flow the 2026-07-28 protocol uses in place of
+server-initiated requests, so a tool can hand the user to the upload page through
+URL-mode elicitation, or a harness the upload target, instead of printing a link in
+prose. ``authenticator`` and ``current_principal`` let the upload endpoint require the
+same bearer token as the server's MCP requests.
 """
 
 from __future__ import annotations
 
-from datetime import timedelta
-from typing import TYPE_CHECKING, Any
+from collections.abc import Iterable
 
+from ..auth import Authenticator, Principal, TokenVerifier, bearer_authenticator, token_principal
 from ..gateway import UploadGateway
-from ..types import UploadStatus
 from . import HasCustomRoute
-
-if TYPE_CHECKING:
-    from mcp.server.mcpserver import Context
-    from mcp_types import InputRequiredResult
-
-# The key under which the elicitation travels in inputRequests and comes back in
-# inputResponses. Any stable string works; the client echoes it.
-INPUT_KEY = "upload"
-
-DEFAULT_MESSAGE = "A file is needed. Open the link to upload it."
+from ._rounds import DEFAULT_MESSAGE, INPUT_KEY, ask_for_upload, target_of
 
 
 def attach(server: HasCustomRoute, gateway: UploadGateway) -> None:
@@ -31,66 +23,48 @@ def attach(server: HasCustomRoute, gateway: UploadGateway) -> None:
 
     The route is served by the same Starlette app the SDK returns from
     ``streamable_http_app()``. The SDK does not apply its authorization to custom
-    routes, which is what this endpoint needs: a browser or a curl command has no
-    bearer token, and the ticket in the URL is the credential.
+    routes. By default that is what this endpoint needs: a browser or a curl command
+    has no bearer token, and the ticket in the URL is the credential. A gateway built
+    with ``authenticate=authenticator(verifier)`` checks the token itself.
     """
     for route in gateway.routes():
         server.custom_route(route.path, methods=sorted(route.methods or []))(route.endpoint)
 
 
-async def ask_for_upload(
-    ctx: Context[Any, Any],
-    gateway: UploadGateway,
-    destination: str,
+def authenticator(
+    verifier: TokenVerifier,
     *,
-    message: str = DEFAULT_MESSAGE,
-    caller: str | None = None,
-    owner: str | None = None,
-    ttl: timedelta | None = None,
-    max_size: int | None = None,
-    accept: tuple[str, ...] | None = None,
-) -> InputRequiredResult | UploadStatus:
-    """Ask the user for a file through URL-mode elicitation, in two rounds.
+    principal: Principal = token_principal,
+    required_scopes: Iterable[str] = (),
+) -> Authenticator:
+    """An upload authenticator that checks ``Authorization: Bearer`` with the same
+    ``TokenVerifier`` the server was built with, so an upload needs the same token as
+    a tool call. Pass the result as ``UploadGateway(authenticate=...)``.
 
-    Since protocol 2026-07-28 a server cannot open a request to the client in the
-    middle of a call; there is no channel for it. Instead the tool returns an
-    ``InputRequiredResult`` naming what it needs, the client collects it and retries
-    the same call with the answers attached, and the tool body runs again from the
-    top. This helper hides that. On the first round it mints a ticket and asks the
-    client to send the user to the upload page. On the retry it reads the answer and
-    reports the record's status. The record id rides in ``request_state``, which the
-    client echoes back, so the retry does not mint a second ticket.
+    ``principal`` must be the function ``current_principal`` uses when tickets are
+    issued, which is the default for both."""
+    return bearer_authenticator(verifier, principal=principal, required_scopes=required_scopes)
 
-    ``request_state`` comes back from the client and is not trusted for anything but
-    a lookup. The status of a record is not secret; only the ticket is, and the
-    ticket is never in the state.
 
-    Annotate the tool as returning ``UploadStatus | InputRequiredResult``. The SDK
-    derives the output schema from the status half and passes the other through.
-    """
-    from mcp_types import ElicitRequest, ElicitRequestURLParams, InputRequiredResult
+def current_principal(principal: Principal = token_principal) -> str | None:
+    """The principal of the access token on the request being handled, or ``None``
+    without one. Pass it as the ``owner`` of a ticket so that only the same user's
+    token can upload to it, for example ``ask_for_upload(..., owner=current_principal())``.
 
-    state = ctx.request_state
-    if not isinstance(state, str) or not state.startswith("up_"):
-        issued = await gateway.issue(
-            destination, caller=caller, owner=owner, ttl=ttl, max_size=max_size, accept=accept
-        )
-        params = ElicitRequestURLParams(
-            mode="url",
-            message=message,
-            url=issued.upload_url,
-            elicitation_id=issued.record.id,
-        )
-        return InputRequiredResult(
-            input_requests={INPUT_KEY: ElicitRequest(params=params)},
-            request_state=issued.record.id,
-        )
+    Reads the SDK's auth context, which is set inside tool and method handlers of a
+    server built with a ``token_verifier``."""
+    from mcp.server.auth.middleware.auth_context import get_access_token
 
-    status = await gateway.status(state, owner=owner)
-    answer = (ctx.input_responses or {}).get(INPUT_KEY)
-    action = getattr(answer, "action", None)
-    if status["status"] == "issued" and action in ("decline", "cancel"):
-        # The user did not open the link. The ticket stays valid until it expires,
-        # which is harmless: nobody has it but the client that just refused it.
-        status["status"] = "declined" if action == "decline" else "cancelled"
-    return status
+    token = get_access_token()
+    return None if token is None else principal(token)
+
+
+__all__ = [
+    "DEFAULT_MESSAGE",
+    "INPUT_KEY",
+    "ask_for_upload",
+    "attach",
+    "authenticator",
+    "current_principal",
+    "target_of",
+]

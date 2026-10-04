@@ -40,11 +40,15 @@ class UploadTicketExtension(ServerExtension):  # type: ignore[misc,unused-ignore
         *,
         destination: str | None = None,
         owner: OwnerResolver | None = None,
+        destinations: Sequence[str] = (),
     ) -> None:
-        self._handler = make_handler(gateway, destination, owner)
+        self._handler = make_handler(gateway, destination, owner, destinations)
 
     def settings(self) -> dict[str, Any]:
-        return extension_settings(methods=self._handler is not None)
+        return extension_settings(
+            methods=self._handler is not None,
+            destinations=self._handler.allowed if self._handler is not None else (),
+        )
 
     def methods(self) -> Sequence[MethodBinding]:
         if self._handler is None:

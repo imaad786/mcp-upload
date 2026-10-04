@@ -23,13 +23,19 @@ as separate processes over real sockets, and the gateway's memory is sampled fro
 outside. It covers sustained throughput, hundreds of concurrent uploads, slow clients,
 oversized part headers, epilogues, bursts past the concurrency cap, a mixed run
 with failing clients and a flaky backend, uploads into function and filesystem sinks,
-and raw-body uploads, and it writes JSON so two versions can be compared:
+raw-body uploads, bearer tokens on uploads, headless MCP flows and destination choice,
+and it writes JSON so two versions can be compared:
 
 ```
 .venv/bin/python stress/run.py --src src --out after.json
 ```
 
-The two processes are `stress/gateway.py` and `stress/backend.py`. The backend commits
+The two processes are `stress/gateway.py` and `stress/backend.py`. `headless_flow` and
+`destination_choice` start `stress/mcp_server.py` in place of the gateway: an official
+SDK `MCPServer` with the gateway attached, its MCP route guarded by a bearer token
+verifier, a tool that asks for a file with `ask_for_upload`, and the extension
+offering one destination besides the default. The harness drives it with the official
+SDK client, as a headless harness would. The backend commits
 an upload only when the request body ended cleanly, and records the size and SHA-256
 of every commit, so the harness can check that what the gateway reported is what
 actually arrived. The gateway is killed if its memory passes 6,000 MB, to protect the
@@ -38,7 +44,8 @@ machine.
 Each scenario is a function in `stress/run.py`, and `--only` runs some of them by name,
 for example `--only header_bomb,claim_race`. The Redis scenarios, such as
 `redis_two_replicas` and `store_backed_uploads`, need a real Redis at `--redis-url`
-(`redis://localhost:56379/0` by default). `sqlite_migration` needs an older tree in
+(`redis://localhost:56379/0` by default). `bearer_auth` runs its Redis race only when
+one is reachable there, and says so in its result otherwise. `sqlite_migration` needs an older tree in
 `--old-src` and reports itself unsupported without one.
 
 ### Comparing two versions

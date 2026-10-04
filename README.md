@@ -144,6 +144,9 @@ the bytes can finish the job.
 - **An agent with a shell**, such as Claude Code, runs `curl -F file=@path <url>`.
 - **A client that supports URL-mode elicitation** shows the link and asks the user for
   consent, when the tool uses `ask_for_upload`.
+- **A harness with no person present** reads the upload target that `ask_for_upload`
+  puts in the tool's `input_required` result, sends the bytes itself, and retries. The
+  upload endpoint can require the same bearer token as the server's MCP requests.
 - **Your own program** posts the file and then asks the server what happened, or calls
   `upload_file`.
 
@@ -204,16 +207,16 @@ workers, and `RedisStore` for a server behind a load balancer.
 - [Why it exists](https://github.com/imaad786/mcp-upload/blob/main/guide/why.md): the
   problem in full, the alternatives compared, and the limits and non-goals.
 - [Using it](https://github.com/imaad786/mcp-upload/blob/main/guide/usage.md): how an
-  upload flows, owners, declared digests and claiming, URL elicitation, `on_complete`
-  and OpenTelemetry, the extension, `files/authorizeUpload` with its errors, and the
-  example.
+  upload flows, owners, declared digests and claiming, URL elicitation, headless
+  harnesses, bearer tokens on uploads, `on_complete` and OpenTelemetry, the extension,
+  `files/authorizeUpload` with its errors and destination choice, and the example.
 - [Where the bytes go](https://github.com/imaad786/mcp-upload/blob/main/guide/destinations.md):
   HTTP backends, function destinations, the filesystem sink, raw-body uploads and the
   upload page.
 - [The ticket and the endpoint](https://github.com/imaad786/mcp-upload/blob/main/guide/ticket.md):
   why the ticket is enough, the stores, every refusal and its error code, and streaming.
 - [Deploying it](https://github.com/imaad786/mcp-upload/blob/main/guide/deploying.md):
-  TLS, limits, destinations, logs and reporting a vulnerability.
+  TLS, limits, destinations, logs, bearer tokens and reporting a vulnerability.
 - [Testing it](https://github.com/imaad786/mcp-upload/blob/main/guide/testing.md): the
   test suite, the stress harness, the fuzz, the SEP-2631 flows and the nightly job.
 - [Security](https://github.com/imaad786/mcp-upload/blob/main/SECURITY.md): the threat

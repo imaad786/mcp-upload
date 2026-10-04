@@ -17,12 +17,22 @@ never take is ``-32602`` with machine-readable ``data``, such as
 ``{"reason": "maxSizeExceeded", "maxSize": 1000, "actualSize": 5000}``, so a client
 can tell the user why without parsing a message. A full ticket store is ``-32603``.
 A server without the method answers ``-32601``, which the SDK does on its own.
+
+The proposal's request names no destination, and every upload goes to the one the
+server configured. A server may also let clients choose from a closed list of
+destination names it declares. A client names one in the request's ``_meta``, under
+the extension's identifier, since the proposal's params have no such field::
+
+    {"name": "q3.pdf", "_meta": {"me.imaadkhan/upload-ticket": {"destination": "archive"}}}
+
+Any other name is ``-32602`` with ``{"reason": "destinationNotAllowed", "allowed":
+[...]}``. A name is all a client can send. It never becomes a URL, host or path.
 """
 
 from __future__ import annotations
 
 import inspect
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 from mcp.shared.exceptions import MCPError
@@ -34,14 +44,14 @@ from ..gateway import UploadGateway
 from ..multipart import split_media_type
 from ..store import StoreFull
 from ..tickets import Constraints, sha256_hex
-from ..types import FileDigest, FileValue
+from ..types import EXTENSION_ID, FileDigest, FileValue
 
 if TYPE_CHECKING:
     from mcp.server.context import ServerRequestContext
 
 #: Reverse-DNS identifier for the pattern this library implements. The prefix is a
 #: domain Imaad owns, per SEP-2133, and is not an MCP-organization namespace.
-IDENTIFIER = "me.imaadkhan/upload-ticket"
+IDENTIFIER = EXTENSION_ID
 
 METHOD = "files/authorizeUpload"
 
@@ -78,12 +88,14 @@ class AuthorizeUploadResult(Result):
     upload: dict[str, Any]
 
 
-def extension_settings(methods: bool) -> dict[str, Any]:
+def extension_settings(methods: bool, destinations: Sequence[str] = ()) -> dict[str, Any]:
     """What the client sees at ``capabilities.extensions[IDENTIFIER]``.
 
     Deliberately small. Anything a client needs in order to perform a particular
     upload already travels in that upload's own ``FileTransferDescriptor``, so
-    repeating it here would be a second copy able to drift from the first.
+    repeating it here would be a second copy able to drift from the first. The one
+    addition is the list of destination names a client may choose from, when the
+    server offers a choice, since a client cannot learn it any other way.
     """
     settings: dict[str, Any] = {
         "version": "1",
@@ -92,6 +104,8 @@ def extension_settings(methods: bool) -> dict[str, Any]:
     }
     if methods:
         settings["methods"] = [METHOD]
+    if destinations:
+        settings["destinations"] = list(destinations)
     return settings
 
 
@@ -102,10 +116,11 @@ def invalid(message: str, **data: Any) -> MCPError:
 class AuthorizeUpload:
     """The ``files/authorizeUpload`` handler: validate, issue, describe.
 
-    ``destination`` names the registered destination every ticket goes to, since the
-    request carries none and must not be able to pick one. ``owner`` resolves the
-    request to the user the ticket is bound to, so only that user's ``status`` and
-    ``claim`` see the record.
+    ``destination`` names the registered destination a ticket goes to when the
+    request names none. ``destinations`` lists the names a request may choose
+    instead, in its ``_meta``. Empty, the default, means no choice: the request cannot
+    pick a destination. ``owner`` resolves the request to the user the ticket is bound
+    to, so only that user's ``status`` and ``claim`` see the record.
     """
 
     def __init__(
@@ -114,24 +129,42 @@ class AuthorizeUpload:
         destination: str,
         *,
         owner: OwnerResolver | None = None,
+        destinations: Sequence[str] = (),
     ) -> None:
+        if isinstance(destinations, str):
+            raise TypeError("destinations is a sequence of names, not one name")
         self._gateway = gateway
         self._destination = destination
         self._owner = owner
+        #: The names a request may pick, the default first. Fixed at startup.
+        self.allowed: tuple[str, ...] = (
+            tuple(dict.fromkeys((destination, *destinations))) if destinations else ()
+        )
         # Fail at startup rather than on the first request.
-        destination_of(gateway, destination)
+        for name in (destination, *destinations):
+            destination_of(gateway, name)
 
     async def __call__(
         self, ctx: ServerRequestContext[Any, Any], params: AuthorizeUploadParams
     ) -> dict[str, Any]:
+        name = self._chosen(params)
         try:
-            dest = destination_of(self._gateway, self._destination)
+            dest = destination_of(self._gateway, name)
         except UnknownDestination:
             raise MCPError(
                 code=INTERNAL_ERROR, message="upload destination is not configured"
             ) from None
         mime_type = check(params, dest)
         owner = await self._resolve_owner(ctx)
+        if owner is None and not self._gateway.ticket_in_url:
+            # Only the owner's token can upload on such a gateway, so a ticket without
+            # one could never be used. The server is missing an owner resolver, or the
+            # request reached it unauthenticated.
+            raise MCPError(
+                code=INTERNAL_ERROR,
+                message="uploads here need an authenticated user",
+                data={"reason": "ownerRequired"},
+            )
         digest: FileDigest | None = None
         if params.digest is not None:
             digest = {"algorithm": params.digest.algorithm, "value": params.digest.value}
@@ -162,6 +195,23 @@ class AuthorizeUpload:
         if mime_type is not None:
             file["mimeType"] = mime_type
         return {"file": dict(file), "upload": dict(described["upload"])}
+
+    def _chosen(self, params: AuthorizeUploadParams) -> str:
+        """The destination the request names in its ``_meta``, if it may, else the
+        default. Only a name from the declared list gets through."""
+        meta = params.meta or {}
+        entry = meta.get(IDENTIFIER) if isinstance(meta, dict) else None
+        if not isinstance(entry, dict) or "destination" not in entry:
+            return self._destination
+        requested = entry["destination"]
+        allowed = list(self.allowed or (self._destination,))
+        if not isinstance(requested, str) or requested not in allowed:
+            raise invalid(
+                "that destination is not offered here",
+                reason="destinationNotAllowed",
+                allowed=allowed,
+            )
+        return requested
 
     async def _resolve_owner(self, ctx: ServerRequestContext[Any, Any]) -> str | None:
         if self._owner is None:
@@ -226,16 +276,19 @@ def destination_of(gateway: UploadGateway, name: str) -> Destination:
 
 
 def make_handler(
-    gateway: UploadGateway | None, destination: str | None, owner: OwnerResolver | None
+    gateway: UploadGateway | None,
+    destination: str | None,
+    owner: OwnerResolver | None,
+    destinations: Sequence[str] = (),
 ) -> AuthorizeUpload | None:
     """The handler an extension serves, or ``None`` for an advertise-only extension."""
     if gateway is None:
-        if destination is not None or owner is not None:
-            raise ValueError("destination and owner need a gateway")
+        if destination is not None or owner is not None or destinations:
+            raise ValueError("destination, destinations and owner need a gateway")
         return None
     if destination is None:
         raise ValueError("files/authorizeUpload needs a destination name")
-    return AuthorizeUpload(gateway, destination, owner=owner)
+    return AuthorizeUpload(gateway, destination, owner=owner, destinations=destinations)
 
 
 def binding_args(handler: AuthorizeUpload) -> tuple[str, type[BaseModel], AuthorizeUpload]:

@@ -16,10 +16,16 @@ The order of operations on a POST is the whole design:
    gateway itself writes nothing to disk.
 5. Record the terminal state on the surviving record so it can be looked up later.
 
-The endpoint asks for no session, header or OAuth token. The ticket is the
+By default the endpoint asks for no session, header or OAuth token. The ticket is the
 authorization. That is safe only because the ticket is 256 bits of CSPRNG entropy,
 stored as a hash, valid for one redemption enforced atomically, expiring in minutes,
 bound to a destination the server author chose, and useless for reading anything back.
+
+A gateway built with an ``authenticate`` function also requires a bearer token, checked
+before step 2 so a refused request learns nothing about the record and spends nothing.
+With ``ticket_in_url=False`` the token is the only credential: the URL names the record
+by its public id, the token's principal must be the record's owner, and single use is
+still enforced by the same atomic flip in step 3, through the hash the record stores.
 """
 
 from __future__ import annotations
@@ -27,7 +33,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import logging
+import re
 import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -46,6 +54,7 @@ from streaming_form_data.parser import UnexpectedPartException
 from streaming_form_data.targets import BaseTarget
 
 from . import page
+from .auth import Authenticator
 from .destinations import Destination, Registry, UnknownDestination
 from .multipart import (
     Framer,
@@ -74,7 +83,14 @@ from .tickets import (
     sha256_hex,
     utcnow,
 )
-from .types import AwaitingUpload, FileDigest, FileTransferDescriptor, FileValue, UploadStatus
+from .types import (
+    EXTENSION_ID,
+    AwaitingUpload,
+    FileDigest,
+    FileTransferDescriptor,
+    FileValue,
+    UploadStatus,
+)
 
 # The library logs through this name. Records are identified by their public id only.
 # The ticket secret and the upload URL never appear in a log line.
@@ -130,7 +146,16 @@ ERROR_STATUS: dict[str, int] = {
     "store_full": 503,
     "misconfigured": 500,
     "internal": 500,
+    # Only on a gateway built with ``authenticate``. Each is decided before the ticket
+    # is touched. Bandit reads the RFC 6750 error name as a password.
+    "auth_required": 401,
+    "invalid_token": 401,  # nosec B105
+    "forbidden": 403,
 }
+
+# What tickets.new_id produces: "up_" and base64url characters. A bearer-only URL names
+# a record by this, and anything else is refused without a store lookup.
+_RECORD_ID = re.compile(r"^up_[A-Za-z0-9_-]{1,64}$")
 
 
 class UploadError(Exception):
@@ -167,7 +192,9 @@ class ClaimRefused(Exception):
 @dataclass(frozen=True, slots=True)
 class Issued:
     """A freshly issued ticket. ``secret`` leaves the server exactly once, inside
-    ``upload_url``. It is not stored anywhere."""
+    ``upload_url``. It is not stored anywhere. On a gateway built with
+    ``ticket_in_url=False`` it is empty and ``upload_url`` names the record by its id,
+    since the bearer token is the credential there."""
 
     record: Record
     secret: str
@@ -195,6 +222,8 @@ class UploadGateway:
         on_complete: Callable[[Record], Awaitable[None]] | None = None,
         telemetry: bool = True,
         raw_uploads: bool = False,
+        authenticate: Authenticator | None = None,
+        ticket_in_url: bool = True,
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         """
@@ -238,6 +267,20 @@ class UploadGateway:
         Every limit applies as it does to a form upload. A URL-encoded form body is
         never taken as a file. Off by default, and then anything but
         ``multipart/form-data`` is refused as before.
+
+        ``authenticate`` also requires a credential on every upload, usually a bearer
+        token (see ``mcp_upload.auth.bearer_authenticator``). It is awaited with the
+        request and returns the principal the request proves, or ``None``. A request
+        with no principal gets 401 with ``WWW-Authenticate: Bearer``, and one whose
+        principal is not the record's owner gets 403, both before the ticket is spent.
+        A record with no owner accepts any authenticated principal. The upload page
+        cannot send a header, so a GET explains that instead of showing the form.
+
+        ``ticket_in_url=False`` makes the bearer token the only credential. Upload URLs
+        then name the record by its public id and carry no secret, every ticket must be
+        issued with an ``owner``, and only that owner's token can upload. It needs
+        ``authenticate``. With the default, ``True``, the URL carries the ticket as
+        before and, if ``authenticate`` is set, both are required.
         """
         if ttl <= timedelta(0):
             raise ValueError("ttl must be positive")
@@ -247,6 +290,8 @@ class UploadGateway:
             raise ValueError("max_in_flight must be at least 1, or None for no cap")
         if queue_size < 1:
             raise ValueError("queue_size must be at least 1")
+        if not ticket_in_url and authenticate is None:
+            raise ValueError("ticket_in_url=False needs authenticate, or nothing guards uploads")
         self._base_url = base_url.rstrip("/")
         self._registry = registry
         self._store = store
@@ -271,6 +316,8 @@ class UploadGateway:
         self._on_complete = on_complete
         self._telemetry = Telemetry(telemetry)
         self._raw_uploads = raw_uploads
+        self._authenticate = authenticate
+        self._ticket_in_url = ticket_in_url
         self._clock = clock
         self._transport = urlsplit(self._base_url).scheme or "https"
 
@@ -279,6 +326,16 @@ class UploadGateway:
     @property
     def path(self) -> str:
         return self._path
+
+    @property
+    def authenticates(self) -> bool:
+        """True when uploads need a credential besides the URL."""
+        return self._authenticate is not None
+
+    @property
+    def ticket_in_url(self) -> bool:
+        """False when the bearer token is the only credential and URLs carry none."""
+        return self._ticket_in_url
 
     async def issue(
         self,
@@ -335,6 +392,8 @@ class UploadGateway:
             raise ValueError("ttl must be positive")
         if ttl is not None and ttl > self._retention:
             raise ValueError("ttl must not exceed the gateway's retention")
+        if not self._ticket_in_url and owner is None:
+            raise ValueError("this gateway checks uploads against an owner, so issue needs one")
         now = self._clock()
         secret = new_secret()
         record = Record(
@@ -351,6 +410,33 @@ class UploadGateway:
         await self._store.put(record)
         self._telemetry.issued(dest.name)
         logger.info("issued %s for destination %s", record.id, dest.name)
+        if not self._ticket_in_url:
+            # The hash above is of a secret nobody will ever hold. It still keys the
+            # record for the atomic redemption, which is all it is needed for here.
+            # An empty secret, not a hardcoded one, whatever bandit thinks.
+            return Issued(record=record, secret="", upload_url=self._id_url(record.id))  # nosec B106
+        return Issued(record=record, secret=secret, upload_url=self.upload_url(secret))
+
+    async def resume(
+        self, record_id: str, secret: str | None = None, *, owner: str | None = None
+    ) -> Issued | None:
+        """The ``Issued`` for a ticket minted earlier, so a caller can describe the same
+        upload again, for example when a client retries before uploading.
+
+        ``secret`` must be the ticket the record was issued with. It is checked against
+        the stored hash, so a wrong one gets ``None`` rather than a URL. On a gateway
+        with ``ticket_in_url=False`` no secret is needed. ``None`` also when the record
+        is unknown or bound to a different owner. The record may be in any state, and
+        the caller decides whether describing it again makes sense.
+        """
+        record = await self._store.get(record_id)
+        if record is None or not _visible(record, owner):
+            return None
+        if not self._ticket_in_url:
+            # An empty secret, not a hardcoded one, whatever bandit thinks.
+            return Issued(record=record, secret="", upload_url=self._id_url(record.id))  # nosec B106
+        if not secret or not hmac.compare_digest(hash_secret(secret), record.ticket_hash):
+            return None
         return Issued(record=record, secret=secret, upload_url=self.upload_url(secret))
 
     def destination(self, name: str) -> Destination:
@@ -360,6 +446,9 @@ class UploadGateway:
 
     def upload_url(self, secret: str) -> str:
         return f"{self._base_url}{self._path}/{secret}"
+
+    def _id_url(self, record_id: str) -> str:
+        return f"{self._base_url}{self._path}/{record_id}"
 
     def uri(self, record_id: str) -> str:
         return f"mcp-file://{self._server_name}/{record_id}"
@@ -375,6 +464,10 @@ class UploadGateway:
         needs a gateway built with ``raw_uploads=True``. Its ``headers`` carry the
         Content-Type to send when one is known: ``media_type`` if given, else the
         ticket's accept list when that names exactly one type.
+
+        On a gateway that authenticates uploads, ``upload`` also carries
+        ``{"_meta": {EXTENSION_ID: {"auth": "bearer"}}}``: send the bearer token used
+        for MCP requests to this server. No token is ever part of the description.
         """
         record = issued.record
         upload: FileTransferDescriptor
@@ -400,6 +493,8 @@ class UploadGateway:
                 "multipart": {"fileField": self._field},
                 "expiresAt": _iso(record.expires_at),
             }
+        if self._authenticate is not None:
+            upload["_meta"] = {EXTENSION_ID: {"auth": "bearer"}}
         file: FileValue = {"uri": self.uri(record.id)}
         if record.constraints.expected_size is not None:
             file["size"] = record.constraints.expected_size
@@ -502,6 +597,18 @@ class UploadGateway:
         return response
 
     async def _render_form(self, request: Request, secret: str) -> Response:
+        if self._authenticate is not None:
+            # A browser following a link sends no Authorization header, and the page's
+            # form could not add one. Say so rather than show a form that would fail.
+            # Nothing is looked up, so the page reveals nothing about the record.
+            body = page.message(
+                "This upload needs a sign-in token",
+                "The program that asked for this file sends it, with the same access "
+                "token it uses for this server. It can't be done from a browser page.",
+            )
+            response = _html(body, 401)
+            response.headers["WWW-Authenticate"] = "Bearer"
+            return response
         # Reading the record does not spend the ticket. The form is shown only while
         # the ticket is still redeemable, so a stale link says so instead of failing
         # after the user picked a file.
@@ -546,11 +653,29 @@ class UploadGateway:
             self._in_flight -= 1
 
     async def _ingest_in_slot(self, request: Request, secret: str, raw: bool) -> Response:
-        ticket_hash = hash_secret(secret)
+        principal: str | None = None
+        if self._authenticate is not None:
+            # Before any lookup, so a request without a valid token learns nothing about
+            # the record, not even whether it exists, and spends nothing.
+            refused, principal = await self._authenticated(request)
+            if refused is not None:
+                return refused
         now = self._clock()
-        record = await self._store.get_by_hash(ticket_hash)
+        if self._ticket_in_url:
+            ticket_hash = hash_secret(secret)
+            record = await self._store.get_by_hash(ticket_hash)
+        else:
+            # The path names the record. The token is the credential, so the record must
+            # belong to its principal. Redemption below still goes through the stored
+            # hash, the same atomic flip as a ticket's.
+            record = await self._store.get(secret) if _RECORD_ID.match(secret) else None
+            ticket_hash = "" if record is None else record.ticket_hash
         if record is None:
             return self._error_response(request, None, "unknown_ticket")
+        if self._authenticate is not None and not _owned_by(
+            record, principal, strict=not self._ticket_in_url
+        ):
+            return self._error_response(request, record, "forbidden", {"reason": "ownerMismatch"})
         if record.status is not Status.ISSUED:
             return self._error_response(request, record, "ticket_used")
         if record.expired(now) and not getattr(self._store, "decides_expiry", False):
@@ -610,6 +735,29 @@ class UploadGateway:
             return self._success_response(request, final)
         details = dict(outcome.details) if outcome.details else None
         return self._error_response(request, final, outcome.error or "internal", details)
+
+    async def _authenticated(self, request: Request) -> tuple[Response | None, str | None]:
+        """The principal the request proves, or the refusal to send instead."""
+        authenticate = self._authenticate
+        if authenticate is None:  # pragma: no cover - the caller checked
+            return None, None
+        try:
+            principal = await authenticate(request)
+        except Exception:
+            logger.exception("the upload authenticator raised")
+            details = {"reason": "authenticatorFailed"}
+            return self._error_response(request, None, "internal", details), None
+        if principal is not None:
+            return None, principal
+        if "authorization" in request.headers:
+            refused = self._error_response(
+                request, None, "invalid_token", {"reason": "invalidToken"}
+            )
+        else:
+            refused = self._error_response(
+                request, None, "auth_required", {"reason": "authRequired"}
+            )
+        return refused, None
 
     # ----- streaming ---------------------------------------------------------------
 
@@ -811,9 +959,14 @@ class UploadGateway:
         if details:
             body["details"] = details
         logger.warning("refused %s: %s", record.id if record else "-", code)
-        headers = {"Retry-After": "5"} if code == "too_many_uploads" else None
+        headers = {"Retry-After": "5"} if code == "too_many_uploads" else {}
+        if code in _CHALLENGES:
+            headers["WWW-Authenticate"] = _CHALLENGES[code]
         if _wants_html(request):
-            return _html(page.message("Upload failed", code.replace("_", " ")), http_status)
+            response = _html(page.message("Upload failed", code.replace("_", " ")), http_status)
+            if code in _CHALLENGES:
+                response.headers["WWW-Authenticate"] = _CHALLENGES[code]
+            return response
         return _json(body, http_status, headers)
 
 
@@ -1259,6 +1412,26 @@ def _expected_sha256(digest: FileDigest | str | None) -> str | None:
 
 def _visible(record: Record, owner: str | None) -> bool:
     return owner is None or record.owner is None or record.owner == owner
+
+
+def _owned_by(record: Record, principal: str | None, *, strict: bool) -> bool:
+    """Whether an authenticated principal may upload to ``record``. A record with no
+    owner takes any principal, unless ``strict``, where the token is the only
+    credential and an owner is the only thing to check it against."""
+    if principal is None:
+        return False
+    if record.owner is None:
+        return not strict
+    return hmac.compare_digest(record.owner.encode(), principal.encode())
+
+
+# RFC 6750's challenges: none for a request with no credentials, invalid_token for one
+# whose token was refused.
+# Bandit reads the challenge as a password.
+_CHALLENGES = {
+    "auth_required": "Bearer",
+    "invalid_token": 'Bearer error="invalid_token"',  # nosec B105
+}
 
 
 async def _notify(hook: Callable[[Record], Awaitable[None]], record: Record) -> None:

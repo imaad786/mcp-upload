@@ -35,6 +35,10 @@ MUST_BE_ZERO = (
     "temp_files_left",
     "bob_status_leaks",
     "bob_claim_wins",
+    "refused_but_committed",
+    "owner_after_refusal_wrong_bytes",
+    "landed_elsewhere_or_wrong_bytes",
+    "commits_to_destinations_not_offered",
 )
 MUST_BE_TRUE = (
     "integrity_ok",
@@ -215,6 +219,81 @@ def raw_uploads(r: dict[str, Any], out: Problems) -> None:
         )
 
 
+# What each kind of bad token must get. A connection reset (status 0) is tolerated, as
+# for every early refusal in this harness: the gateway answered and closed while the
+# client was still writing. The record check below proves the ticket was not spent.
+_AUTH_HTTP = {"missing": "401", "invalid": "401", "other_owner": "403"}
+
+
+def bearer_auth(r: dict[str, Any], out: Problems) -> None:
+    for part in ("ticket_bearer", "bearer"):
+        p = r.get(part)
+        name = f"bearer_auth.{part}"
+        if unsupported(p):
+            continue
+        if not isinstance(p, dict):
+            out.append(f"{name} missing")
+            continue
+        if p.get("honest_outcomes") != {"completed": 100}:
+            out.append(f"{name}.honest_outcomes = {p.get('honest_outcomes')!r}")
+        kinds = p.get("refusal_outcomes_by_kind") or {}
+        if set(kinds) != set(_AUTH_HTTP):
+            out.append(f"{name}.refusal_outcomes_by_kind has {sorted(kinds)}")
+        for kind, outcomes in kinds.items():
+            never_completed(f"{name}.refusal_outcomes_by_kind.{kind}", outcomes, out)
+        for kind, codes in (p.get("refusal_http_by_kind") or {}).items():
+            if extra := set(codes) - {_AUTH_HTTP.get(kind), "0"}:
+                out.append(f"{name}.refusal_http_by_kind.{kind} has {sorted(extra)}")
+        for kind, after in (p.get("record_after_refusal_by_kind") or {}).items():
+            if set(after) != {"issued"}:
+                out.append(f"{name}.record_after_refusal_by_kind.{kind} = {after!r}")
+        if p.get("owner_after_refusal_outcomes") != {"completed": 30}:
+            out.append(
+                f"{name}.owner_after_refusal_outcomes = {p.get('owner_after_refusal_outcomes')!r}"
+            )
+        one_winner_each(
+            f"{name}.race_tickets_by_winner_count", p.get("race_tickets_by_winner_count"), out
+        )
+        if part == "bearer" and p.get("urls_with_a_secret") != 0:
+            out.append(f"{name}.urls_with_a_secret = {p.get('urls_with_a_secret')!r}")
+    for part in ("bearer_race_sqlite", "bearer_race_redis"):
+        p = r.get(part)
+        if unsupported(p) or (isinstance(p, dict) and "skipped" in p):
+            continue
+        if not isinstance(p, dict):
+            out.append(f"bearer_auth.{part} missing")
+            continue
+        one_winner_each(
+            f"bearer_auth.{part}.race_tickets_by_winner_count",
+            p.get("race_tickets_by_winner_count"),
+            out,
+        )
+
+
+def all_flows_passed(
+    name: str, kinds: tuple[str, ...]
+) -> Callable[[dict[str, Any], Problems], None]:
+    def check(r: dict[str, Any], out: Problems) -> None:
+        flows = r.get("flows") or {}
+        for kind in kinds:
+            entry = flows.get(kind)
+            if not isinstance(entry, dict):
+                out.append(f"{name}.flows.{kind} missing")
+            elif entry.get("failed") != 0 or entry.get("passed") != entry.get("flows"):
+                out.append(
+                    f"{name}.flows.{kind}: {entry.get('passed')}/{entry.get('flows')} passed "
+                    f"{entry.get('errors', [])}"
+                )
+        commits, expected = r.get("backend_commits"), r.get("expected_commits")
+        if not isinstance(commits, int) or commits != expected:
+            out.append(f"{name}: {commits!r} backend commits, {expected!r} expected")
+        matching = r.get("commits_matching_sent_sha256", expected)
+        if matching != expected:
+            out.append(f"{name}: {matching!r} commits match the bytes sent, {expected!r} expected")
+
+    return check
+
+
 SPECIFIC: dict[str, Callable[[dict[str, Any], Problems], None]] = {
     "header_bomb": header_bomb,
     "header_bomb_under_load": header_bomb_under_load,
@@ -231,6 +310,13 @@ SPECIFIC: dict[str, Callable[[dict[str, Any], Problems], None]] = {
     "filename_hygiene": filename_hygiene,
     "sink_mixed_failures": sink_mixed_failures,
     "raw_uploads": raw_uploads,
+    "bearer_auth": bearer_auth,
+    "headless_flow": all_flows_passed(
+        "headless_flow", ("good", "early_retry", "proof_mismatch", "wrong_token")
+    ),
+    "destination_choice": all_flows_passed(
+        "destination_choice", ("default", "archive", "not_offered", "url")
+    ),
 }
 
 

@@ -9,6 +9,11 @@ With ``--sink memory`` the ``files`` destination is an in-process function that 
 what it reads and commits only on a normal end. With ``--sink filesystem`` it is the
 library's filesystem sink, writing to ``--sink-dir`` with the record id as the name.
 
+``--auth ticket_bearer`` requires a bearer token as well as the ticket, and ``--auth
+bearer`` makes the token the only credential. Tokens are ``tok.<user>.<mac>``, where the
+MAC is an HMAC of the user under a key the harness shares, so a forged or altered token
+is refused. The principal is the user.
+
 Options the installed version does not know are dropped, so the same harness runs
 against old and new releases and each runs on its own defaults. A request for a
 feature the version lacks gets ``{"unsupported": name}`` with status 400.
@@ -19,12 +24,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import hmac
 import inspect
 import os
 import tempfile
 from collections import Counter
 from datetime import timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
 import uvicorn
 from starlette.applications import Starlette
@@ -34,6 +41,25 @@ from starlette.routing import Route
 
 import mcp_upload
 from mcp_upload import Destination, MemoryStore, Registry, SqliteStore, UploadGateway
+
+TOKEN_KEY = b"stress-harness-token-key"
+
+
+def token_for(user: str) -> str:
+    """A token the stress gateway accepts for ``user``. The harness mints them too."""
+    mac = hmac.new(TOKEN_KEY, user.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"tok.{user}.{mac}"
+
+
+async def authenticate(request: Request) -> str | None:
+    header = request.headers.get("authorization", "")
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    parts = token.strip().split(".")
+    if len(parts) != 3 or parts[0] != "tok":
+        return None
+    return parts[1] if hmac.compare_digest(token.strip(), token_for(parts[1])) else None
 
 
 def sink_support() -> dict[str, bool]:
@@ -173,6 +199,10 @@ def build(args: argparse.Namespace) -> Starlette:
         options["on_complete"] = on_complete
     if args.raw_uploads:
         options["raw_uploads"] = True
+    if args.auth != "ticket":
+        options["authenticate"] = authenticate
+        if args.auth == "bearer":
+            options["ticket_in_url"] = False
     accepted = inspect.signature(UploadGateway.__init__).parameters
     gateway = UploadGateway(**{k: v for k, v in options.items() if k in accepted})
     issue_params = inspect.signature(gateway.issue).parameters
@@ -191,6 +221,8 @@ def build(args: argparse.Namespace) -> Starlette:
         "redis_pool": args.redis_pool if args.store == "redis" else None,
         "raw_uploads": "raw_uploads" in accepted,
         "raw_uploads_on": bool(args.raw_uploads) and "raw_uploads" in accepted,
+        "authenticate": "authenticate" in accepted and "ticket_in_url" in accepted,
+        "auth_mode": args.auth if "authenticate" in accepted else "ticket",
         **support,
         "sink_active": args.sink if sink is not None else None,
     }
@@ -220,7 +252,9 @@ def build(args: argparse.Namespace) -> Starlette:
         return JSONResponse(
             {
                 "id": record.id,
-                "path": f"{gateway.path}/{issued.secret}",
+                # The URL's own path: the ticket on a default gateway, the record id on a
+                # bearer-only one.
+                "path": urlsplit(issued.upload_url).path,
                 "ttl": (record.expires_at - record.issued_at).total_seconds(),
             }
         )
@@ -303,6 +337,12 @@ def main() -> None:
     parser.add_argument("--sink", choices=["memory", "filesystem"], default=None)
     parser.add_argument("--sink-dir", default=None, help="directory for --sink filesystem")
     parser.add_argument("--raw-uploads", action="store_true")
+    parser.add_argument(
+        "--auth",
+        choices=["ticket", "ticket_bearer", "bearer"],
+        default="ticket",
+        help="what an upload needs: the ticket, the ticket and a token, or a token only",
+    )
     args = parser.parse_args()
     uvicorn.run(build(args), host="127.0.0.1", port=args.port, log_level="warning", backlog=4096)
 

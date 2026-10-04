@@ -50,10 +50,14 @@ class UploadTicketExtension(Extension):
     """Declares that this server issues short-lived single-use upload tickets, and
     with a ``gateway`` serves ``files/authorizeUpload`` from it.
 
-    ``destination`` is the registered destination every authorized upload goes to.
-    The request names none, and must not be able to. ``owner`` maps the request
-    context to the user the ticket is bound to; pass it on any server with more than
-    one user, or anyone who learns a file URI can read its name, size and digest.
+    ``destination`` is the registered destination an authorized upload goes to. By
+    default the request cannot name another. ``destinations`` lists the registered
+    names a client may choose from instead, by naming one in the request's ``_meta``
+    under ``IDENTIFIER`` as ``{"destination": name}``. Any other name is refused with
+    -32602 and ``{"reason": "destinationNotAllowed", "allowed": [...]}``, and the list
+    is advertised in the extension's settings. ``owner`` maps the request context to
+    the user the ticket is bound to. Pass it on any server with more than one user, or
+    anyone who learns a file URI can read its name, size and digest.
     """
 
     identifier = IDENTIFIER
@@ -64,13 +68,17 @@ class UploadTicketExtension(Extension):
         *,
         destination: str | None = None,
         owner: OwnerResolver | None = None,
+        destinations: Sequence[str] = (),
     ) -> None:
-        self._handler = make_handler(gateway, destination, owner)
+        self._handler = make_handler(gateway, destination, owner, destinations)
 
     def settings(self) -> dict[str, Any]:
         """What the client sees at ``capabilities.extensions[IDENTIFIER]``. Lists
         ``files/authorizeUpload`` under ``methods`` when the server answers it."""
-        return extension_settings(methods=self._handler is not None)
+        return extension_settings(
+            methods=self._handler is not None,
+            destinations=self._handler.allowed if self._handler is not None else (),
+        )
 
     def methods(self) -> Sequence[MethodBinding]:
         if self._handler is None:
