@@ -52,11 +52,25 @@ class TokenRefused(Exception):
     """Raised by an authenticator for a token it verified but will not accept. The
     gateway answers 401 ``invalid_token`` with ``details: {"reason": reason}``, before
     the ticket is looked up or spent. Returning ``None`` gives the same status with the
-    reason ``invalidToken``."""
+    reason ``invalidToken``. The subclass ``InsufficientScope`` gets 403 instead."""
 
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class InsufficientScope(TokenRefused):
+    """Raised by an authenticator for a verified token that lacks a scope the server
+    requires. The gateway answers 403 ``insufficient_scope``, as the official SDK's MCP
+    endpoint does (RFC 6750 section 3.1), with
+    ``details: {"reason": "insufficientScope", "required": [...]}`` and a
+    ``WWW-Authenticate`` challenge naming the scopes, before the ticket is looked up or
+    spent. ``missing`` defaults to ``required``."""
+
+    def __init__(self, required: Iterable[str], missing: Iterable[str] = ()):
+        super().__init__("insufficientScope")
+        self.required = tuple(required)
+        self.missing = tuple(missing) or self.required
 
 
 class TokenVerifier(Protocol):
@@ -133,9 +147,11 @@ def bearer_authenticator(
     """An authenticator that reads ``Authorization: Bearer <token>``, checks the token
     with ``verifier``, and returns ``principal(token)``.
 
-    A token the verifier refuses, one past its ``expires_at``, and one without every
-    scope in ``required_scopes`` all authenticate nobody. Pass the scopes your MCP
-    endpoint requires, so a token that could not call a tool cannot upload either.
+    A token the verifier refuses and one past its ``expires_at`` authenticate nobody.
+    One without every scope in ``required_scopes`` raises ``InsufficientScope``, which
+    the gateway answers with 403 ``insufficient_scope``, as the SDK's MCP endpoint
+    answers it. Pass the scopes your MCP endpoint requires, so a token that could not
+    call a tool cannot upload either.
 
     ``resource`` is the server's canonical URL, its ``resource_server_url``. With it,
     a token whose ``resource`` (the RFC 8707 resource indicator the verifier reports)
@@ -145,7 +161,7 @@ def bearer_authenticator(
     ``mcp`` 2.1 carry no ``resource``, so with binding requested every one of them is
     refused.
     """
-    scopes = frozenset(required_scopes)
+    scopes = tuple(dict.fromkeys(required_scopes))
     bound = None if resource is None else canonical_resource(resource)
 
     async def authenticate(request: Request) -> str | None:
@@ -160,8 +176,10 @@ def bearer_authenticator(
             return None
         if bound is not None and not issued_for(verified, bound):
             raise TokenRefused("wrongResource")
-        if scopes and not scopes <= set(getattr(verified, "scopes", None) or ()):
-            return None
+        if scopes:
+            held = set(getattr(verified, "scopes", None) or ())
+            if missing := [scope for scope in scopes if scope not in held]:
+                raise InsufficientScope(scopes, missing)
         return principal(verified)
 
     return authenticate
@@ -169,6 +187,7 @@ def bearer_authenticator(
 
 __all__ = [
     "Authenticator",
+    "InsufficientScope",
     "Principal",
     "TokenRefused",
     "TokenVerifier",

@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.1.2 (2026-10-05)
+
+Consistency fix for gateways that check bearer tokens on uploads (`authenticate=`).
+Ticket-only gateways, the default, are not affected.
+
+- **Fixed: a valid token without a required scope got a different answer on the
+  upload route.** The official SDK's MCP endpoint answers such a token with 403 and
+  `WWW-Authenticate: Bearer error="insufficient_scope"` (RFC 6750 section 3.1). The
+  upload route answered 401 `invalid_token`. It now answers 403 `insufficient_scope`
+  with `WWW-Authenticate: Bearer error="insufficient_scope", error_description="Required scope: <first missing>", scope="<every required scope>"`
+  and `details: {"reason": "insufficientScope", "required": [...]}`, still before the
+  record is looked up or the ticket spent. In the `bearer_resource` stress scenario,
+  against a real MCP server process whose settings require a scope, 50 uploads per
+  bearer mode with the caller's own token minus that scope got 401 `invalid_token` on
+  1.1.1 while the MCP endpoint gave the same tokens 403 `insufficient_scope`. On 1.1.2
+  all 100 got 403 `insufficient_scope` from both routes. On both versions every one of
+  those tickets stayed unspent, none of those bytes were committed, and the owners'
+  uploads then completed.
+- `mcp_upload.auth.InsufficientScope(required, missing=())`, a subclass of
+  `TokenRefused`, is what `bearer_authenticator` now raises for a missing scope, and
+  any authenticator can raise it. `TokenRefused(reason)` still answers 401
+  `invalid_token`. A missing token is still 401 `auth_required`, a refused or expired
+  token or one for another resource still 401 `invalid_token`, and another user's
+  token still 403 `forbidden`. `ERROR_STATUS` gains `insufficient_scope: 403`.
+- FastMCP 4.0.10's `JWTVerifier` and `StaticTokenVerifier` refuse a token without a
+  required scope inside `verify_token`, so with them both routes answer 401
+  `invalid_token`, as before. With a provider that leaves scopes to FastMCP's
+  middleware, both routes now answer 403 `insufficient_scope`.
+- The challenge carries no `resource_metadata`, as the gateway's other challenges do
+  not, because the gateway is not told the protected resource metadata URL. The SDK's
+  endpoint adds one built from `resource_server_url`.
+
 ## 1.1.1 (2026-10-05)
 
 Security fix for gateways that check bearer tokens on uploads (`authenticate=`).

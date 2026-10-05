@@ -41,7 +41,11 @@ def authenticator(
     own auth provider, so an upload needs the same token as a tool call.
 
     Pass the ``FastMCP`` server (its ``auth`` is used) or an ``AuthProvider``.
-    ``required_scopes`` defaults to the provider's own, as on the MCP route.
+    ``required_scopes`` defaults to the provider's own, as on the MCP route. A token
+    without one gets 403 ``insufficient_scope``, as FastMCP's middleware answers it,
+    unless the provider refuses it in ``verify_token`` first, as FastMCP 4.0.10's
+    ``JWTVerifier`` and ``StaticTokenVerifier`` do; then both routes answer 401
+    ``invalid_token``.
 
     FastMCP 4's MCP route leaves the token's audience to the provider's
     ``verify_token`` (``JWTVerifier(audience=...)``, for example), which this

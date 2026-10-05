@@ -50,8 +50,10 @@ def authenticator(
     MCP endpoint does and is never looser: ``required_scopes`` defaults to its
     ``required_scopes``, and when it sets ``validate_token_resource=True`` a token
     issued for any resource but its ``resource_server_url`` is refused with 401
-    ``invalid_token`` and the reason ``wrongResource``, before the ticket is spent.
-    Without ``auth`` no resource is checked and no scope is required, as before.
+    ``invalid_token`` and the reason ``wrongResource``, before the ticket is spent. A
+    valid token without a required scope gets 403 ``insufficient_scope``, as on the MCP
+    endpoint. Without ``auth`` no resource is checked and no scope is required, as
+    before.
 
     ``resource`` overrides the binding: a URL binds tokens to that resource whatever
     ``auth`` says, and ``False`` turns the check off. On ``mcp`` 2.1, whose settings

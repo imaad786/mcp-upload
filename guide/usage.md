@@ -342,8 +342,12 @@ There are three modes:
   No token is 401 with `WWW-Authenticate: Bearer` and `{"reason": "authRequired"}`. A
   token the verifier refuses, or one past its expiry, is 401 `invalid_token`. A token
   issued for another resource is 401 `invalid_token` with
-  `{"reason": "wrongResource"}`. Another user's valid token is 403 `forbidden` with
-  `{"reason": "ownerMismatch"}`.
+  `{"reason": "wrongResource"}`. A valid token without a scope the authenticator
+  requires is 403 `insufficient_scope`, as the official SDK's MCP endpoint answers it
+  (RFC 6750 section 3.1), with
+  `WWW-Authenticate: Bearer error="insufficient_scope", error_description="Required scope: files", scope="files"`
+  and `{"reason": "insufficientScope", "required": ["files"]}`. Another user's valid
+  token is 403 `forbidden` with `{"reason": "ownerMismatch"}`.
 - **The same audience as the MCP endpoint.** With `auth=settings`, the upload route
   checks a token as the MCP endpoint does: the settings' `required_scopes`, and with
   `validate_token_resource=True` only tokens whose `resource` is `resource_server_url`,
@@ -374,7 +378,10 @@ required scopes, and `current_principal()` reads FastMCP's access token. FastMCP
 the token's audience to the provider (`JWTVerifier(audience=...)`), whose
 `verify_token` the upload route calls too. `resource=` adds the SDK's resource check on
 top, for a provider that sets `AccessToken.resource`; the providers in FastMCP 4.0.10
-do not.
+do not. FastMCP 4.0.10's `JWTVerifier` and `StaticTokenVerifier` also refuse a token
+without a required scope inside `verify_token`, so both routes answer it with 401
+`invalid_token`. A provider that leaves scopes to FastMCP's middleware gets 403
+`insufficient_scope` from both.
 
 ```python
 from mcp_upload.adapters.fastmcp import authenticator, current_principal
@@ -388,7 +395,8 @@ Starlette request and returns a principal or `None`, and
 `mcp_upload.auth.bearer_authenticator` builds one from any object with
 `async verify_token(token)`, and takes `resource=` for the same binding. An
 authenticator can raise `mcp_upload.auth.TokenRefused(reason)` to answer 401
-`invalid_token` with that reason.
+`invalid_token` with that reason, or `mcp_upload.auth.InsufficientScope(required)` to
+answer 403 `insufficient_scope`.
 
 ### After an upload
 

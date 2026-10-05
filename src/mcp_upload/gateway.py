@@ -54,7 +54,7 @@ from streaming_form_data.parser import UnexpectedPartException
 from streaming_form_data.targets import BaseTarget
 
 from . import page
-from .auth import Authenticator, TokenRefused
+from .auth import Authenticator, InsufficientScope, TokenRefused
 from .destinations import Destination, Registry, UnknownDestination
 from .multipart import (
     Framer,
@@ -150,6 +150,7 @@ ERROR_STATUS: dict[str, int] = {
     # is touched. Bandit reads the RFC 6750 error name as a password.
     "auth_required": 401,
     "invalid_token": 401,  # nosec B105
+    "insufficient_scope": 403,
     "forbidden": 403,
 }
 
@@ -274,7 +275,9 @@ class UploadGateway:
         with no principal gets 401 with ``WWW-Authenticate: Bearer``, and one whose
         principal is not the record's owner gets 403, both before the ticket is spent.
         An authenticator that raises ``mcp_upload.auth.TokenRefused`` gets 401
-        ``invalid_token`` with its reason, also before the ticket is spent.
+        ``invalid_token`` with its reason, also before the ticket is spent, and one that
+        raises its subclass ``InsufficientScope`` gets 403 ``insufficient_scope`` with
+        the required scopes, as the official SDK's MCP endpoint answers such a token.
         A record with no owner accepts any authenticated principal. The upload page
         cannot send a header, so a GET explains that instead of showing the form.
 
@@ -745,6 +748,11 @@ class UploadGateway:
             return None, None
         try:
             principal = await authenticate(request)
+        except InsufficientScope as exc:
+            details = {"reason": exc.reason, "required": list(exc.required)}
+            challenge = _scope_challenge(exc)
+            refused = self._error_response(request, None, "insufficient_scope", details, challenge)
+            return refused, None
         except TokenRefused as exc:
             details = {"reason": exc.reason}
             return self._error_response(request, None, "invalid_token", details), None
@@ -954,6 +962,7 @@ class UploadGateway:
         record: Record | None,
         code: str,
         details: dict[str, Any] | None = None,
+        challenge: str | None = None,
     ) -> Response:
         http_status = ERROR_STATUS.get(code, 500)
         if record is None or record.status is Status.ISSUED:
@@ -965,12 +974,13 @@ class UploadGateway:
             body["details"] = details
         logger.warning("refused %s: %s", record.id if record else "-", code)
         headers = {"Retry-After": "5"} if code == "too_many_uploads" else {}
-        if code in _CHALLENGES:
-            headers["WWW-Authenticate"] = _CHALLENGES[code]
+        challenge = challenge or _CHALLENGES.get(code)
+        if challenge is not None:
+            headers["WWW-Authenticate"] = challenge
         if _wants_html(request):
             response = _html(page.message("Upload failed", code.replace("_", " ")), http_status)
-            if code in _CHALLENGES:
-                response.headers["WWW-Authenticate"] = _CHALLENGES[code]
+            if challenge is not None:
+                response.headers["WWW-Authenticate"] = challenge
             return response
         return _json(body, http_status, headers)
 
@@ -1431,12 +1441,34 @@ def _owned_by(record: Record, principal: str | None, *, strict: bool) -> bool:
 
 
 # RFC 6750's challenges: none for a request with no credentials, invalid_token for one
-# whose token was refused.
+# whose token was refused, insufficient_scope for a valid token without a required
+# scope. The last gets the scopes added by _scope_challenge when they are known.
 # Bandit reads the challenge as a password.
 _CHALLENGES = {
     "auth_required": "Bearer",
     "invalid_token": 'Bearer error="invalid_token"',  # nosec B105
+    "insufficient_scope": 'Bearer error="insufficient_scope"',
 }
+
+
+def _scope_challenge(refusal: InsufficientScope) -> str:
+    """The insufficient_scope challenge, in the form the official SDK's MCP endpoint
+    sends (an error_description naming the first missing scope), plus RFC 6750's
+    ``scope`` attribute listing every required scope, which the official SDK's client
+    reads first when it asks for a token with more scopes."""
+    parts = [_CHALLENGES["insufficient_scope"]]
+    if refusal.missing:
+        parts.append(f'error_description="Required scope: {_quoted(refusal.missing[0])}"')
+    if refusal.required:
+        parts.append(f'scope="{_quoted(" ".join(refusal.required))}"')
+    return ", ".join(parts)
+
+
+def _quoted(value: str) -> str:
+    """``value`` as the inside of an HTTP quoted-string: printable ASCII only, since a
+    scope is (RFC 6749 section 3.3) and a header value must encode."""
+    value = "".join(c for c in value if " " <= c <= "~")
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 async def _notify(hook: Callable[[Record], Awaitable[None]], record: Record) -> None:

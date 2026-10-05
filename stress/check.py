@@ -286,6 +286,15 @@ def bearer_resource(r: dict[str, Any], out: Problems) -> None:
             "ticket_after_wrong_resource": {"issued": n},
             "owner_after_wrong_resource": {"completed": n},
             "mcp_endpoint_with_wrong_resource": {"401": n},
+            # A valid token without a required scope: 403 insufficient_scope from both
+            # routes (RFC 6750 section 3.1), before the ticket is spent.
+            "missing_scope_upload": {"403 insufficient_scope": n},
+            "missing_scope_upload_reason": {"insufficientScope": n},
+            "missing_scope_upload_challenge": {"insufficient_scope": n},
+            "ticket_after_missing_scope": {"issued": n},
+            "owner_after_missing_scope": {"completed": n},
+            "mcp_endpoint_with_missing_scope": {"403 insufficient_scope": n},
+            "missing_scope_same_answer_as_mcp": n,
             "flow_errors": [],
         }
         for key, want in expected.items():
@@ -295,10 +304,10 @@ def bearer_resource(r: dict[str, Any], out: Problems) -> None:
             out.append(
                 f"{name}.wrong_resource_upload_http = {p.get('wrong_resource_upload_http')!r}"
             )
-        if p.get("backend_commits") != 2 * n or p.get("expected_commits") != 2 * n:
+        if p.get("backend_commits") != 3 * n or p.get("expected_commits") != 3 * n:
             out.append(
                 f"{name}: {p.get('backend_commits')!r} backend commits, "
-                f"{p.get('expected_commits')!r} expected, {2 * n} flows"
+                f"{p.get('expected_commits')!r} expected, {3 * n} flows"
             )
         if p.get("commits_matching_sent_sha256") != p.get("expected_commits"):
             out.append(

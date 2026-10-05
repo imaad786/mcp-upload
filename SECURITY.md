@@ -46,6 +46,7 @@ Who can reach what, and what each of them can do:
 | Holder of a valid ticket, usually the user or an agent acting for them | One upload URL | Upload one file to the one destination the ticket names, within its size, type and digest limits | Upload twice, choose the destination, read any file back, hold a slot by sending slowly, exhaust memory with oversized part headers |
 | Holder of an upload URL in bearer-only mode, such as anyone who read a transcript | A record id | Nothing without the owner's token | Upload, since the URL carries no secret |
 | Holder of a token issued for another service by the same authorization server, in either bearer mode | A token the shared verifier accepts, whose resource is not this server | Nothing, when the authenticator is built from settings with `validate_token_resource=True` or given `resource` | Upload or spend a ticket: 401 `invalid_token`, `wrongResource` |
+| Holder of a valid token for this server without a scope it requires, in either bearer mode | A token the MCP endpoint refuses with 403 `insufficient_scope` | Nothing, when the authenticator has the server's required scopes | Upload or spend a ticket: 403 `insufficient_scope`, `insufficientScope` |
 | Another authenticated user, in either bearer mode | Their own valid token, and a URL or record id | Learn from a 403 that the record exists (ids are 72 random bits) | Upload to a record owned by someone else, spend its ticket |
 | Holder of the owner's token in bearer-only mode | The token and the record id | Upload one file to that record | Upload twice: fifty concurrent attempts have one winner |
 | A tool caller (often the model) | Tool arguments | Ask the server for a ticket, pass a file URI to a tool | Name a URL, host or path to stream into; use another owner's file when owners are set |
@@ -58,11 +59,11 @@ sockets: header bombs, slow clients, bursts past the concurrency cap, replayed a
 racing tickets, mismatched digests, other owners, a gateway killed mid-upload, malformed
 and randomized multipart framing, and failing clients and backends in one mixed run.
 The bearer modes have their own: missing, forged and other users' tokens, tokens
-issued for another resource against a real MCP server that refuses them, bearer-only
-replay races on the memory and SQLite stores and on Redis when one is reachable,
-headless flows against a real MCP server process, and destinations a client was not
-offered. A nightly CI job runs the ones that do not depend on timing and checks their
-invariants.
+issued for another resource and tokens without a required scope against a real MCP
+server that refuses them, bearer-only replay races on the memory and SQLite stores and
+on Redis when one is reachable, headless flows against a real MCP server process, and
+destinations a client was not offered. A nightly CI job runs the ones that do not
+depend on timing and checks their invariants.
 The timing-based ones (slow clients, a gateway killed mid-upload, the connection pool
 ceiling) run in the before-and-after comparisons for each release.
 

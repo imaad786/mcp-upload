@@ -28,6 +28,7 @@ from starlette.requests import Request
 
 from mcp_upload import Destination, MemoryStore, Registry, SqliteStore, Store, UploadGateway
 from mcp_upload.auth import (
+    InsufficientScope,
     TokenRefused,
     bearer_authenticator,
     bearer_token,
@@ -89,8 +90,9 @@ AUDIENCES: dict[str, str | None] = {
 
 class Verifier:
     """Accepts ``<user>-token`` and refuses anything else. ``expired-token`` verifies
-    but is past its expiry, and ``noscope-token`` carries no scopes. Every token is
-    issued for ``OWN`` unless it names another audience after an ``@``."""
+    but is past its expiry, and ``noscope-token`` carries no scopes, nor does
+    ``<user>+noscope-token``. Every token is issued for ``OWN`` unless it names another
+    audience after an ``@``."""
 
     def __init__(self) -> None:
         self.calls = 0
@@ -100,6 +102,8 @@ class Verifier:
         if not token.endswith("-token"):
             return None
         user = token.removesuffix("-token")
+        if user.endswith("+noscope"):
+            return Token(token, subject=user.removesuffix("+noscope"), scopes=[])
         if "@" in user:
             user, audience = user.split("@", 1)
             return Token(token, subject=user, resource=AUDIENCES[audience])
@@ -169,8 +173,10 @@ async def post(
     return await client.post(url, content=body, headers=headers)
 
 
-def subject_auth(resource: str | None = None) -> Authenticate:
-    return bearer_authenticator(Verifier(), principal=by_subject, resource=resource)
+def subject_auth(resource: str | None = None, scopes: tuple[str, ...] = ()) -> Authenticate:
+    return bearer_authenticator(
+        Verifier(), principal=by_subject, resource=resource, required_scopes=scopes
+    )
 
 
 # ----- the default mode is unchanged ---------------------------------------------------
@@ -604,7 +610,7 @@ async def test_official_adapter_takes_the_server_scopes() -> None:
 
     settings = sdk_settings(False, scopes=["files"])
     inherited = adapter.authenticator(Verifier(), principal=by_subject, auth=settings)
-    assert await outcome(inherited, "noscope-token") == "refused"
+    assert await outcome(inherited, "noscope-token") == "insufficientScope"
     assert await outcome(inherited, "alice-token") == "alice"
     overridden = adapter.authenticator(
         Verifier(), principal=by_subject, auth=settings, required_scopes=()
@@ -700,6 +706,265 @@ async def test_fastmcp_adapter_binds_only_when_asked() -> None:
     assert await outcome(bound, "bob-token") == "refused"
 
 
+# ----- scopes (RFC 6750 insufficient_scope) --------------------------------------------
+
+SCOPE_CHALLENGE = (
+    'Bearer error="insufficient_scope", error_description="Required scope: files", scope="files"'
+)
+
+
+@pytest.mark.parametrize("ticket_in_url", [True, False])
+async def test_a_token_without_the_scope_is_403_and_spends_nothing(
+    upstream: Upstream, ticket_in_url: bool
+) -> None:
+    store = CountingStore()
+    gateway = build(
+        upstream, store, authenticate=subject_auth(scopes=("files",)), ticket_in_url=ticket_in_url
+    )
+    issued = await gateway.issue("files", owner="alice")
+    async with serve(gateway) as client:
+        # The owner's own token, valid and for this server, but without the scope.
+        refused = await post(client, issued.upload_url, token="alice+noscope-token")
+        assert refused.status_code == 403, refused.text
+        assert refused.json() == {
+            "status": "failed",
+            "error": "insufficient_scope",
+            "details": {"reason": "insufficientScope", "required": ["files"]},
+        }
+        assert refused.headers["www-authenticate"] == SCOPE_CHALLENGE
+        page = await client.post(
+            issued.upload_url,
+            content=b"x",
+            headers={
+                "Authorization": "Bearer alice+noscope-token",
+                "Accept": "text/html",
+                "Content-Type": "multipart/form-data; boundary=x",
+            },
+        )
+        assert page.status_code == 403
+        assert page.headers["www-authenticate"] == SCOPE_CHALLENGE
+        assert store.lookups == 0
+        assert (await gateway.status(issued.record.id))["status"] == "issued"
+        assert upstream.bodies == []
+        accepted = await post(client, issued.upload_url, token="alice-token")
+    assert accepted.status_code == 200, accepted.text
+    assert upstream.bodies == [b"hello"]
+
+
+@pytest.mark.parametrize("ticket_in_url", [True, False])
+@pytest.mark.parametrize(
+    ("token", "status", "code", "reason"),
+    [
+        (None, 401, "auth_required", "authRequired"),
+        ("not a token", 401, "invalid_token", "invalidToken"),
+        ("expired-token", 401, "invalid_token", "invalidToken"),
+        # The resource is checked first, as the SDK does: its backend refuses the token
+        # before the scope middleware sees it.
+        ("alice@other-token", 401, "invalid_token", "wrongResource"),
+        ("bob-token", 403, "forbidden", "ownerMismatch"),
+    ],
+)
+async def test_other_refusals_are_unchanged_when_scopes_are_required(
+    upstream: Upstream, ticket_in_url: bool, token: str | None, status: int, code: str, reason: str
+) -> None:
+    authenticate = subject_auth(OWN, scopes=("files",))
+    gateway = build(upstream, authenticate=authenticate, ticket_in_url=ticket_in_url)
+    issued = await gateway.issue("files", owner="alice")
+    async with serve(gateway) as client:
+        refused = await post(client, issued.upload_url, token=token)
+    assert (refused.status_code, refused.json()["error"]) == (status, code), refused.text
+    assert refused.json()["details"] == {"reason": reason}
+    assert (await gateway.status(issued.record.id))["status"] == "issued"
+    assert upstream.bodies == []
+
+
+async def test_the_challenge_names_every_required_scope(upstream: Upstream) -> None:
+    authenticate = subject_auth(scopes=("files", "upload", "files"))
+    gateway = build(upstream, authenticate=authenticate)
+    issued = await gateway.issue("files", owner="alice")
+    async with serve(gateway) as client:
+        refused = await post(client, issued.upload_url, token="alice-token")
+    assert refused.status_code == 403
+    assert refused.json()["details"] == {
+        "reason": "insufficientScope",
+        "required": ["files", "upload"],
+    }
+    assert refused.headers["www-authenticate"] == (
+        'Bearer error="insufficient_scope", error_description="Required scope: upload", '
+        'scope="files upload"'
+    )
+
+
+async def test_custom_authenticators_can_refuse_for_scope(upstream: Upstream) -> None:
+    async def refuse(request: Request) -> str | None:
+        raise InsufficientScope(["files:write"])
+
+    async def old_style(request: Request) -> str | None:
+        raise TokenRefused("wrongResource")
+
+    for authenticate, status, code in (
+        (refuse, 403, "insufficient_scope"),
+        (old_style, 401, "invalid_token"),
+    ):
+        gateway = build(upstream, authenticate=authenticate)
+        issued = await gateway.issue("files")
+        async with serve(gateway) as client:
+            response = await post(client, issued.upload_url, token="alice-token")
+        assert (response.status_code, response.json()["error"]) == (status, code)
+        assert (await gateway.status(issued.record.id))["status"] == "issued"
+    assert isinstance(InsufficientScope(["a"]), TokenRefused)
+    assert InsufficientScope(["a", "b"]).missing == ("a", "b")
+
+
+def _challenge_error(response: httpx.Response) -> str | None:
+    """The ``error`` attribute of a response's Bearer challenge."""
+    import re
+
+    found = re.search(r'error="([^"]*)"', response.headers.get("www-authenticate", ""))
+    return found.group(1) if found else None
+
+
+@needs_sdk_binding
+@pytest.mark.parametrize("ticket_in_url", [True, False])
+async def test_the_upload_route_answers_a_missing_scope_as_the_mcp_endpoint_does(
+    upstream: Upstream, ticket_in_url: bool
+) -> None:
+    # One MCPServer, one verifier, one AuthSettings with a required scope. The same
+    # token without that scope gets the same status and error code from the MCP
+    # endpoint (the SDK's RequireAuthMiddleware) and from the upload route.
+    from mcp.server.auth.provider import AccessToken
+    from mcp.server.mcpserver import MCPServer
+
+    from mcp_upload.adapters import mcp as adapter
+
+    class SdkTokens:
+        async def verify_token(self, token: str) -> AccessToken | None:
+            found = await Verifier().verify_token(token)
+            if found is None:
+                return None
+            return AccessToken(
+                token=token,
+                client_id="app",
+                subject=found.subject,
+                scopes=found.scopes,
+                resource=found.resource,
+            )
+
+    settings = sdk_settings(True, scopes=["files"])
+    verifier = SdkTokens()
+    gateway = build(
+        upstream,
+        authenticate=adapter.authenticator(verifier, auth=settings),
+        ticket_in_url=ticket_in_url,
+    )
+    server = MCPServer("scoped", auth=settings, token_verifier=verifier)
+    adapter.attach(server, gateway)
+    app = server.streamable_http_app(stateless_http=True, json_response=True)
+    owner = token_principal(await verifier.verify_token("alice-token"))
+    answers: dict[str, dict[str, tuple[int, str | None]]] = {"mcp": {}, "upload": {}}
+    async with (
+        server.session_manager.run(),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE) as client,
+    ):
+        for token in ("alice+noscope-token", "alice@other-token", "forged", "alice-token"):
+            mcp = await client.post(
+                "http://127.0.0.1:8000/mcp",
+                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json, text/event-stream",
+                },
+            )
+            mcp_error = mcp.json().get("error") if mcp.status_code != 200 else None
+            answers["mcp"][token] = (mcp.status_code, mcp_error)
+            assert mcp_error == _challenge_error(mcp)
+            issued = await gateway.issue("files", owner=owner)
+            upload = await post(client, issued.upload_url, token=token)
+            upload_error = upload.json().get("error") if upload.status_code != 200 else None
+            answers["upload"][token] = (upload.status_code, upload_error)
+            if upload.status_code != 200:
+                assert upload_error == _challenge_error(upload)
+                assert (await gateway.status(issued.record.id))["status"] == "issued"
+            if token == "alice+noscope-token":
+                description = 'error_description="Required scope: files"'
+                assert description in mcp.headers["www-authenticate"]
+                assert description in upload.headers["www-authenticate"]
+    assert answers["upload"] == answers["mcp"]
+    assert answers["mcp"] == {
+        "alice+noscope-token": (403, "insufficient_scope"),
+        "alice@other-token": (401, "invalid_token"),
+        "forged": (401, "invalid_token"),
+        "alice-token": (200, None),
+    }
+    assert len(upstream.bodies) == 1
+
+
+@pytest.mark.skipif(not HAS_FASTMCP, reason="fastmcp not installed")
+@pytest.mark.parametrize("checks_in_verifier", [True, False])
+async def test_fastmcp_answers_a_missing_scope_as_its_mcp_endpoint_does(
+    upstream: Upstream, checks_in_verifier: bool
+) -> None:
+    # FastMCP 4's own verifiers refuse a token without a required scope in
+    # verify_token, so its MCP endpoint answers 401 invalid_token, and the upload
+    # route, calling the same verify_token, does too. A verifier that leaves scopes to
+    # the middleware gets 403 insufficient_scope from both.
+    from fastmcp import FastMCP
+    from fastmcp.server.auth import AccessToken as FastToken
+    from fastmcp.server.auth import TokenVerifier as FastVerifier
+    from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+
+    from mcp_upload.adapters import fastmcp as fast_adapter
+
+    tokens: dict[str, dict[str, Any]] = {
+        "alice-token": {"client_id": "app", "sub": "alice", "scopes": ["files"]},
+        "alice+noscope-token": {"client_id": "app", "sub": "alice", "scopes": []},
+    }
+
+    class Lenient(FastVerifier):  # type: ignore[misc,unused-ignore]
+        async def verify_token(self, token: str) -> FastToken | None:
+            data = tokens.get(token)
+            if data is None:
+                return None
+            return FastToken(
+                token=token, client_id="app", scopes=data["scopes"], subject=data["sub"]
+            )
+
+    provider: Any = (
+        StaticTokenVerifier(tokens=tokens, required_scopes=["files"])
+        if checks_in_verifier
+        else Lenient(required_scopes=["files"])
+    )
+    server = FastMCP("scoped", auth=provider)
+    gateway = build(upstream, authenticate=fast_adapter.authenticator(server), ticket_in_url=False)
+    fast_adapter.attach(server, gateway)
+    app = server.http_app(stateless_http=True, json_response=True)
+    owner = token_principal(await provider.verify_token("alice-token"))
+    answers: dict[str, dict[str, tuple[int, str | None]]] = {"mcp": {}, "upload": {}}
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE) as client,
+    ):
+        for token in ("alice+noscope-token", "alice-token"):
+            mcp = await client.post(
+                f"{BASE}/mcp",
+                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json, text/event-stream",
+                },
+            )
+            answers["mcp"][token] = (mcp.status_code, _challenge_error(mcp))
+            issued = await gateway.issue("files", owner=owner)
+            upload = await post(client, issued.upload_url, token=token)
+            answers["upload"][token] = (upload.status_code, _challenge_error(upload))
+            if upload.status_code != 200:
+                assert (await gateway.status(issued.record.id))["status"] == "issued"
+    assert answers["upload"] == answers["mcp"]
+    refusal = (401, "invalid_token") if checks_in_verifier else (403, "insufficient_scope")
+    assert answers["mcp"] == {"alice+noscope-token": refusal, "alice-token": (200, None)}
+    assert len(upstream.bodies) == 1
+
+
 # ----- resume --------------------------------------------------------------------------
 
 
@@ -743,7 +1008,9 @@ async def test_bearer_authenticator_checks_expiry_and_scopes() -> None:
     assert await plain(request_with({"Authorization": "Bearer alice-token"})) == "alice"
     assert await plain(request_with({"Authorization": "Bearer expired-token"})) is None
     assert await plain(request_with({"Authorization": "Bearer noscope-token"})) == "noscope"
-    assert await scoped(request_with({"Authorization": "Bearer noscope-token"})) is None
+    with pytest.raises(InsufficientScope) as refused:
+        await scoped(request_with({"Authorization": "Bearer noscope-token"}))
+    assert (refused.value.reason, refused.value.required) == ("insufficientScope", ("files",))
     assert await scoped(request_with({"Authorization": "Bearer alice-token"})) == "alice"
     assert await plain(request_with({})) is None
 

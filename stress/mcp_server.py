@@ -18,12 +18,15 @@ this server's ``/mcp`` URL (its RFC 8707 resource), except ``tok.<user>@other.<m
 which the verifier accepts for ``user`` but reports as issued for another service.
 ``--validate-resource`` sets the SDK's ``validate_token_resource``, so the MCP route
 refuses those, and hands the same settings to the upload authenticator where the
-library takes them. ``GET /_caps`` says which of these the library under test
-supports. On a version without them the server still starts and reports ``false``, so
-the harness can mark the scenario unsupported.
+library takes them. Every token carries the scope ``files`` except
+``tok.<user>+noscope.<mac>``, valid for ``user`` but with no scopes, and
+``--required-scope files`` makes the settings require it on both routes. ``GET /_caps``
+says which of these the library under test supports. On a version without them the
+server still starts and reports ``false``, so the harness can mark the scenario
+unsupported.
 
     python stress/mcp_server.py --port 8000 --backend http://127.0.0.1:8001 --auth bearer
-    python stress/mcp_server.py ... --auth bearer --validate-resource
+    python stress/mcp_server.py ... --auth bearer --validate-resource --required-scope files
 """
 
 # No ``from __future__ import annotations``: the SDK evaluates a tool's annotations
@@ -79,6 +82,7 @@ def build(args: argparse.Namespace) -> Starlette:
                 **caps,
                 "auth_mode": args.auth,
                 "validate_resource": args.validate_resource,
+                "required_scopes": args.required_scope,
                 "upload_route_takes_server_settings": binds_resource,
             }
         )
@@ -106,16 +110,19 @@ def build(args: argparse.Namespace) -> Starlette:
 
     class Tokens:
         """The MCP route's verifier: the same tokens the upload endpoint takes. A user
-        ending in ``@other`` gets a valid token issued for another service."""
+        ending in ``@other`` gets a valid token issued for another service, and one
+        ending in ``+noscope`` a valid token without the ``files`` scope."""
 
         async def verify_token(self, token: str) -> AccessToken | None:
             parts = token.split(".")
             if len(parts) != 3 or token != token_for(parts[1]):
                 return None
-            user, at, _ = parts[1].partition("@")
+            user, plus, _ = parts[1].partition("+noscope")
+            user, at, _ = user.partition("@")
             audience = "http://other.invalid/mcp" if at else resource
+            scopes = [] if plus else ["files"]
             return AccessToken(
-                token=token, client_id="harness", subject=user, scopes=[], resource=audience
+                token=token, client_id="harness", subject=user, scopes=scopes, resource=audience
             )
 
     verifier = Tokens()
@@ -123,6 +130,7 @@ def build(args: argparse.Namespace) -> Starlette:
         issuer_url=AnyHttpUrl("http://auth.invalid"),
         resource_server_url=AnyHttpUrl(resource),
         validate_token_resource=args.validate_resource,
+        required_scopes=args.required_scope or None,
     )
     options: dict[str, Any] = {}
     if args.auth != "ticket":
@@ -186,6 +194,7 @@ def main() -> None:
     parser.add_argument("--auth", choices=["ticket", "ticket_bearer", "bearer"], default="bearer")
     parser.add_argument("--max-size", type=int, default=8 << 20)
     parser.add_argument("--validate-resource", action="store_true")
+    parser.add_argument("--required-scope", action="append", default=[])
     args = parser.parse_args()
     # Refused uploads are expected here, and each one is logged.
     logging.disable(logging.ERROR)

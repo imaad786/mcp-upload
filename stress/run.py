@@ -2065,6 +2065,14 @@ async def put_bytes(
 ) -> tuple[int, dict[str, Any]]:
     """Send ``data`` as the target's descriptor says, the way a harness would, with no
     help from the library: a form post for a multipart descriptor, else a raw body."""
+    code, body, _ = await put_reply(uploads, target, data, token)
+    return code, body
+
+
+async def put_reply(
+    uploads: Any, target: dict[str, Any], data: bytes, token: str | None
+) -> tuple[int, dict[str, Any], Any]:
+    """``put_bytes``, with the response headers too."""
     upload = target["upload"]
     headers = {"Accept": "application/json", **(upload.get("headers") or {})}
     if token is not None:
@@ -2082,7 +2090,13 @@ async def put_bytes(
         body = response.json()
     except ValueError:
         body = {}
-    return response.status_code, body if isinstance(body, dict) else {}
+    return response.status_code, body if isinstance(body, dict) else {}, response.headers
+
+
+def challenge_error(headers: Any) -> str:
+    """The ``error`` attribute of a Bearer challenge, or ``none``."""
+    found = re.search(r'error="([^"]*)"', headers.get("www-authenticate", ""))
+    return found.group(1) if found else "none"
 
 
 def target_in(result: Any) -> dict[str, Any]:
@@ -2265,7 +2279,13 @@ async def bearer_resource(src: str) -> dict[str, Any]:
     them. The MCP endpoint refuses that token; the upload route must refuse it too, with
     401 before the ticket is spent, commit none of its bytes, and leave the ticket to
     its owner's own token. Raw counts are reported, so a version that accepts the token
-    shows how many it let through."""
+    shows how many it let through.
+
+    The settings also require the scope ``files``, and 50 more flows per mode try the
+    caller's ticket first with the caller's own valid token minus that scope, on the
+    upload route and on the MCP endpoint. The SDK's MCP endpoint answers 403
+    ``insufficient_scope`` (RFC 6750 section 3.1); the upload route must give the same
+    status and error code, before the ticket is spent, and commit nothing."""
     result: dict[str, Any] = {}
     for mode in ("ticket_bearer", "bearer"):
         part = await resource_mode(src, mode)
@@ -2276,7 +2296,7 @@ async def bearer_resource(src: str) -> dict[str, Any]:
 
 
 async def resource_mode(src: str, mode: str, n: int = 50) -> dict[str, Any]:
-    stack = start_mcp(src, mode, "--validate-resource")
+    stack = start_mcp(src, mode, "--validate-resource", "--required-scope", "files")
     caps = await get_json(stack.gateway_port, "/_caps")
     if missing := lacking(caps, "ask_target", "authenticate"):
         return unsupported(stack, missing)
@@ -2287,13 +2307,20 @@ async def resource_mode(src: str, mode: str, n: int = 50) -> dict[str, Any]:
     port = stack.gateway_port
     rng = random.Random(37 if mode == "bearer" else 41)
     sent: dict[str, str] = {}  # record id -> sha256 hex of the bytes that must commit
-    foreign_bytes: set[str] = set()  # sha256 hex of every body sent with a foreign token
+    foreign_bytes: set[str] = set()  # sha256 hex of every body sent with a refused token
     honest: Counter[str] = Counter()
     foreign_http: Counter[str] = Counter()
     foreign_reason: Counter[str] = Counter()
     after_refusal: Counter[str] = Counter()
     owner_after: Counter[str] = Counter()
     mcp_foreign: Counter[str] = Counter()
+    scope_upload: Counter[str] = Counter()
+    scope_reason: Counter[str] = Counter()
+    scope_challenge: Counter[str] = Counter()
+    scope_after: Counter[str] = Counter()
+    scope_owner_after: Counter[str] = Counter()
+    scope_mcp: Counter[str] = Counter()
+    scope_same: list[bool] = []
     errors: list[str] = []
 
     async def ask(session: Any, data: bytes | None, state: str | None = None) -> Any:
@@ -2351,6 +2378,41 @@ async def resource_mode(src: str, mode: str, n: int = 50) -> dict[str, Any]:
         )
         mcp_foreign[str(response.status_code)] += 1
 
+    async def scope_flow(i: int, uploads: Any) -> None:
+        user = f"narrow{i}"
+        data = rng.randbytes(4096)
+        unscoped = rng.randbytes(4096)
+        foreign_bytes.add(hashlib.sha256(unscoped).hexdigest())
+        narrow = token_for(f"{user}+noscope")
+        async with mcp_session(port, user) as session:
+            first = await ask(session, None)
+            target = target_in(first)
+            try:
+                code, body, headers = await put_reply(uploads, target, unscoped, narrow)
+            except httpx.TransportError:
+                code, body, headers = 0, {}, {}
+            upload_answer = f"{code} {body.get('error') or label(code, body)}"
+            scope_upload[upload_answer] += 1
+            scope_reason[(body.get("details") or {}).get("reason") or label(code, body)] += 1
+            scope_challenge[challenge_error(headers)] += 1
+            still = await ask(session, None, first.request_state)
+            scope_after["issued" if isinstance(still, InputRequiredResult) else "spent"] += 1
+            code, body = await put_bytes(uploads, target, data, token_for(user))
+            scope_owner_after[label(code, body)] += 1
+            if code == 200:
+                sent[body["file"]["uri"].rsplit("/", 1)[1]] = hashlib.sha256(data).hexdigest()
+        response = await uploads.post(
+            f"http://127.0.0.1:{port}/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            headers={
+                "Authorization": f"Bearer {narrow}",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+        mcp_answer = f"{response.status_code} {challenge_error(response.headers)}"
+        scope_mcp[mcp_answer] += 1
+        scope_same.append(mcp_answer == upload_answer)
+
     async def guarded(flow: Awaitable[None]) -> None:
         try:
             await flow
@@ -2365,7 +2427,7 @@ async def resource_mode(src: str, mode: str, n: int = 50) -> dict[str, Any]:
             async with gate:
                 await guarded(flow(i, uploads))
 
-        jobs = [one(honest_flow, i) for i in range(n)] + [one(foreign_flow, i) for i in range(n)]
+        jobs = [one(flow, i) for flow in (honest_flow, foreign_flow, scope_flow) for i in range(n)]
         random.Random(7).shuffle(jobs)
         t0 = time.perf_counter()
         await asyncio.gather(*jobs)
@@ -2387,6 +2449,13 @@ async def resource_mode(src: str, mode: str, n: int = 50) -> dict[str, Any]:
             "ticket_after_wrong_resource": dict(after_refusal),
             "owner_after_wrong_resource": dict(owner_after),
             "mcp_endpoint_with_wrong_resource": dict(mcp_foreign),
+            "missing_scope_upload": dict(scope_upload),
+            "missing_scope_upload_reason": dict(scope_reason),
+            "missing_scope_upload_challenge": dict(scope_challenge),
+            "ticket_after_missing_scope": dict(scope_after),
+            "owner_after_missing_scope": dict(scope_owner_after),
+            "mcp_endpoint_with_missing_scope": dict(scope_mcp),
+            "missing_scope_same_answer_as_mcp": sum(scope_same),
             "refused_but_committed": sum(sha in foreign_bytes for sha in shas),
             "backend_commits": len(commits),
             "expected_commits": len(sent),

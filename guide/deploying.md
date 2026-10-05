@@ -41,6 +41,9 @@ for the modes. What changes for a deployment:
   same token verifier or auth provider that guards the MCP route, with the same
   required scopes, so a token that cannot call a tool cannot upload either. On the
   official SDK, pass the server's `AuthSettings` as `authenticator(verifier, auth=...)`.
+  Since 1.1.2 a valid token without a required scope gets the MCP endpoint's answer on
+  the upload route too: 403 `insufficient_scope` with the required scopes in the
+  challenge, before the ticket is spent. 1.1.1 answered 401 `invalid_token`.
 - **The same token audience as the MCP endpoint.** With
   `validate_token_resource=True` in those settings, the MCP endpoint refuses a token
   issued for another resource (RFC 8707), and since 1.1.1 the upload route refuses it
