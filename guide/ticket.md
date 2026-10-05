@@ -109,6 +109,10 @@ ticket, so a stray or hostile non-multipart POST cannot burn someone's pending u
 |---|---|---|
 | `not_multipart`, `missing_boundary` | 415, 400 | Header-only, ticket untouched |
 | `unknown_ticket` | 404 | |
+| `auth_required` | 401 | Bearer modes only. No token was sent. `WWW-Authenticate: Bearer`. Ticket untouched. |
+| `invalid_token` | 401 | The token failed verification, or was issued for another resource (`wrongResource`). Ticket untouched. |
+| `insufficient_scope` | 403 | The token lacks a required scope. The same answer the MCP endpoint gives. Ticket untouched. |
+| `forbidden` | 403 | The token's principal is not the record's owner (`ownerMismatch`). Ticket untouched. |
 | `ticket_used`, `ticket_expired` | 410 | |
 | `too_large` | 413 | On declared length or on the running count |
 | `size_mismatch`, `digest_mismatch` | 422 | Bytes differ from the size or digest declared at issue. Not committed. |
