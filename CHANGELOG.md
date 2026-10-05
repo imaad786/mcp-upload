@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.1.1 (2026-10-05)
+
+Security fix for gateways that check bearer tokens on uploads (`authenticate=`).
+Ticket-only gateways, the default, are not affected.
+
+- **Fixed: the upload route accepted tokens issued for another resource.** `mcp` 2.2
+  added `AccessToken.resource` and `AuthSettings.validate_token_resource`, with which
+  the MCP endpoint refuses a token issued for another resource (RFC 8707 audience
+  binding). The upload authenticator in 1.1.0 called the same verifier but never
+  compared the resource, so a token the MCP endpoint refused could still upload. In
+  the new `bearer_resource` stress scenario, against a real MCP server process with
+  `validate_token_resource=True` and 50 such uploads per bearer mode, 1.1.0 completed
+  all 50 in both modes: their bytes reached the backend, each spent the owner's
+  ticket, and the owner's own upload then failed. With a declared digest the bytes
+  were refused (422) but the ticket was still spent. 1.1.1 refused all 100 with 401
+  before the ticket was spent, committed none of their bytes, and the owners' uploads
+  then completed.
+- `authenticator(verifier, auth=settings)` in `mcp_upload.adapters.mcp` takes the
+  server's `AuthSettings`, so the upload route is never looser than the MCP endpoint:
+  `required_scopes` defaults to the settings' own, and with
+  `validate_token_resource=True` a token whose `resource` is not `resource_server_url`,
+  or that has none, is refused with 401 `invalid_token` and
+  `{"reason": "wrongResource"}`. The URL comparison is the SDK's. `resource="https://..."`
+  binds to another URL and `resource=False` turns the check off. Without `auth` the
+  behaviour is as in 1.1.0.
+- `bearer_authenticator(..., resource=...)` and FastMCP's `authenticator(..., resource=...)`
+  take the binding explicitly. FastMCP's own default is unchanged, because its MCP
+  route leaves the audience to the provider's `verify_token`, which the upload route
+  already calls.
+- On `mcp` 2.1, whose settings and tokens have neither field, nothing is bound by
+  default, and an explicit `resource` refuses every token whose verifier does not
+  report one.
+- `mcp_upload.auth.TokenRefused(reason)` lets any authenticator answer 401
+  `invalid_token` with its own reason.
+- The tests and the stress MCP server set `validate_token_resource` explicitly, so the
+  suite runs without the SDK's `MCPDeprecationWarning`. `bearer_resource` runs in the
+  nightly stress job.
+
 ## 1.1.0 (2026-10-04)
 
 Three features for the pattern the MCP Files Working Group is converging on, where a

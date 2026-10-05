@@ -566,6 +566,7 @@ async def test_owner_from_the_access_token(gateway: UploadGateway, stateless: bo
         auth=AuthSettings(
             issuer_url=AnyHttpUrl("http://auth.test"),
             resource_server_url=AnyHttpUrl("http://127.0.0.1:8000/mcp"),
+            validate_token_resource=False,
         ),
         token_verifier=Tokens(),
         extensions=[UploadTicketExtension(gateway, destination="files", owner=user_of)],

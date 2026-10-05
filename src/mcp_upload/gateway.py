@@ -54,7 +54,7 @@ from streaming_form_data.parser import UnexpectedPartException
 from streaming_form_data.targets import BaseTarget
 
 from . import page
-from .auth import Authenticator
+from .auth import Authenticator, TokenRefused
 from .destinations import Destination, Registry, UnknownDestination
 from .multipart import (
     Framer,
@@ -273,6 +273,8 @@ class UploadGateway:
         request and returns the principal the request proves, or ``None``. A request
         with no principal gets 401 with ``WWW-Authenticate: Bearer``, and one whose
         principal is not the record's owner gets 403, both before the ticket is spent.
+        An authenticator that raises ``mcp_upload.auth.TokenRefused`` gets 401
+        ``invalid_token`` with its reason, also before the ticket is spent.
         A record with no owner accepts any authenticated principal. The upload page
         cannot send a header, so a GET explains that instead of showing the form.
 
@@ -743,6 +745,9 @@ class UploadGateway:
             return None, None
         try:
             principal = await authenticate(request)
+        except TokenRefused as exc:
+            details = {"reason": exc.reason}
+            return self._error_response(request, None, "invalid_token", details), None
         except Exception:
             logger.exception("the upload authenticator raised")
             details = {"reason": "authenticatorFailed"}

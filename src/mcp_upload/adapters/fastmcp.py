@@ -35,19 +35,30 @@ def authenticator(
     *,
     principal: Principal = token_principal,
     required_scopes: Iterable[str] | None = None,
+    resource: str | None = None,
 ) -> Authenticator:
     """An upload authenticator that checks ``Authorization: Bearer`` with the server's
     own auth provider, so an upload needs the same token as a tool call.
 
     Pass the ``FastMCP`` server (its ``auth`` is used) or an ``AuthProvider``.
     ``required_scopes`` defaults to the provider's own, as on the MCP route.
+
+    FastMCP 4's MCP route leaves the token's audience to the provider's
+    ``verify_token`` (``JWTVerifier(audience=...)``, for example), which this
+    authenticator calls too, so by default the upload route accepts the same tokens.
+    ``resource`` adds the SDK's RFC 8707 check on top: a token whose ``resource`` is not
+    that URL, or is missing, is refused with 401 ``invalid_token`` and the reason
+    ``wrongResource``. The providers in FastMCP 4.0.10 do not set ``resource``, so pass it
+    only with a provider that does.
     """
     provider = getattr(server_or_provider, "auth", server_or_provider)
     if provider is None or not hasattr(provider, "verify_token"):
         raise ValueError("the server has no auth provider to check upload tokens with")
     if required_scopes is None:
         required_scopes = getattr(provider, "required_scopes", None) or ()
-    return bearer_authenticator(provider, principal=principal, required_scopes=required_scopes)
+    return bearer_authenticator(
+        provider, principal=principal, required_scopes=required_scopes, resource=resource
+    )
 
 
 def current_principal(principal: Principal = token_principal) -> str | None:

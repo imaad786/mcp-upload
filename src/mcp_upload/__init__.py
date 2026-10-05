@@ -30,7 +30,7 @@ from .types import (
     UploadTarget,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 __all__ = [
     "ERROR_STATUS",

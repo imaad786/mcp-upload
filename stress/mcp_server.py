@@ -13,11 +13,17 @@ token's client id and subject.
   but never offered. Each destination writes to the stress backend under its own key
   prefix, so the harness can see where every upload landed.
 
-``--auth`` picks what an upload needs, as in ``gateway.py``. ``GET /_caps`` says which
-of these the library under test supports. On a version without them the server still
-starts and reports ``false``, so the harness can mark the scenario unsupported.
+``--auth`` picks what an upload needs, as in ``gateway.py``. Every token is issued for
+this server's ``/mcp`` URL (its RFC 8707 resource), except ``tok.<user>@other.<mac>``,
+which the verifier accepts for ``user`` but reports as issued for another service.
+``--validate-resource`` sets the SDK's ``validate_token_resource``, so the MCP route
+refuses those, and hands the same settings to the upload authenticator where the
+library takes them. ``GET /_caps`` says which of these the library under test
+supports. On a version without them the server still starts and reports ``false``, so
+the harness can mark the scenario unsupported.
 
     python stress/mcp_server.py --port 8000 --backend http://127.0.0.1:8001 --auth bearer
+    python stress/mcp_server.py ... --auth bearer --validate-resource
 """
 
 # No ``from __future__ import annotations``: the SDK evaluates a tool's annotations
@@ -59,8 +65,23 @@ def capabilities() -> dict[str, bool]:
 def build(args: argparse.Namespace) -> Starlette:
     caps = capabilities()
 
+    # Not a requirement: a library without it still serves, unbound, which is the point
+    # of comparing it with one that has it.
+    binds_resource = False
+    if caps["authenticate"]:
+        from mcp_upload.adapters import mcp as adapter
+
+        binds_resource = "auth" in inspect.signature(adapter.authenticator).parameters
+
     async def report(request: Request) -> JSONResponse:
-        return JSONResponse({**caps, "auth_mode": args.auth})
+        return JSONResponse(
+            {
+                **caps,
+                "auth_mode": args.auth,
+                "validate_resource": args.validate_resource,
+                "upload_route_takes_server_settings": binds_resource,
+            }
+        )
 
     if not all(caps.values()):
         return Starlette(routes=[Route("/_caps", report)])
@@ -80,22 +101,36 @@ def build(args: argparse.Namespace) -> Starlette:
     from mcp_upload.adapters.mcp_extension import UploadTicketExtension
     from mcp_upload.types import UploadStatus
 
+    origin = f"http://127.0.0.1:{args.port}"
+    resource = f"{origin}/mcp"
+
     class Tokens:
-        """The MCP route's verifier: the same tokens the upload endpoint takes."""
+        """The MCP route's verifier: the same tokens the upload endpoint takes. A user
+        ending in ``@other`` gets a valid token issued for another service."""
 
         async def verify_token(self, token: str) -> AccessToken | None:
             parts = token.split(".")
             if len(parts) != 3 or token != token_for(parts[1]):
                 return None
-            return AccessToken(token=token, client_id="harness", subject=parts[1], scopes=[])
+            user, at, _ = parts[1].partition("@")
+            audience = "http://other.invalid/mcp" if at else resource
+            return AccessToken(
+                token=token, client_id="harness", subject=user, scopes=[], resource=audience
+            )
 
     verifier = Tokens()
+    settings = AuthSettings(
+        issuer_url=AnyHttpUrl("http://auth.invalid"),
+        resource_server_url=AnyHttpUrl(resource),
+        validate_token_resource=args.validate_resource,
+    )
     options: dict[str, Any] = {}
     if args.auth != "ticket":
-        # The library's own helper, around the same verifier the MCP route uses.
-        options["authenticate"] = adapter.authenticator(verifier)
+        # The library's own helper, around the same verifier the MCP route uses, and
+        # the same settings where this version of the library takes them.
+        server_settings = {"auth": settings} if binds_resource else {}
+        options["authenticate"] = adapter.authenticator(verifier, **server_settings)
         options["ticket_in_url"] = args.auth == "ticket_bearer"
-    origin = f"http://127.0.0.1:{args.port}"
     gateway = UploadGateway(
         base_url=origin,
         registry=Registry(
@@ -116,10 +151,7 @@ def build(args: argparse.Namespace) -> Starlette:
 
     server = MCPServer(
         "stress-mcp",
-        auth=AuthSettings(
-            issuer_url=AnyHttpUrl("http://auth.invalid"),
-            resource_server_url=AnyHttpUrl(f"{origin}/mcp"),
-        ),
+        auth=settings,
         token_verifier=verifier,
         extensions=[
             UploadTicketExtension(
@@ -153,6 +185,7 @@ def main() -> None:
     parser.add_argument("--backend", required=True)
     parser.add_argument("--auth", choices=["ticket", "ticket_bearer", "bearer"], default="bearer")
     parser.add_argument("--max-size", type=int, default=8 << 20)
+    parser.add_argument("--validate-resource", action="store_true")
     args = parser.parse_args()
     # Refused uploads are expected here, and each one is logged.
     logging.disable(logging.ERROR)

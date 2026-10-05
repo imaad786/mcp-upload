@@ -24,7 +24,10 @@ server author's verifier before the record is looked up or the ticket spent. Wit
 `ticket_in_url=False` the token is the only credential: the URL names the record by its
 public id, every record has an owner, only a token whose principal is that owner can
 upload, and single use is enforced by the same atomic redemption, through the hash the
-record stores.
+record stores. Built from the server's auth settings, the authenticator also holds a
+token to the same audience as the MCP endpoint: with the SDK's
+`validate_token_resource=True`, a token issued for another resource (RFC 8707) is
+refused on uploads as it is on MCP requests.
 
 Beyond that, the library refuses requests that cannot carry a file before the ticket
 is touched, enforces the size limit on the bytes it receives rather than on the
@@ -42,6 +45,7 @@ Who can reach what, and what each of them can do:
 | Anyone on the network | The endpoint URL | Fetch the upload page, send requests | Guess a ticket (256 bits), learn anything from refusals beyond an error code. With `authenticate` set, learn whether a ticket or record exists without a valid token |
 | Holder of a valid ticket, usually the user or an agent acting for them | One upload URL | Upload one file to the one destination the ticket names, within its size, type and digest limits | Upload twice, choose the destination, read any file back, hold a slot by sending slowly, exhaust memory with oversized part headers |
 | Holder of an upload URL in bearer-only mode, such as anyone who read a transcript | A record id | Nothing without the owner's token | Upload, since the URL carries no secret |
+| Holder of a token issued for another service by the same authorization server, in either bearer mode | A token the shared verifier accepts, whose resource is not this server | Nothing, when the authenticator is built from settings with `validate_token_resource=True` or given `resource` | Upload or spend a ticket: 401 `invalid_token`, `wrongResource` |
 | Another authenticated user, in either bearer mode | Their own valid token, and a URL or record id | Learn from a 403 that the record exists (ids are 72 random bits) | Upload to a record owned by someone else, spend its ticket |
 | Holder of the owner's token in bearer-only mode | The token and the record id | Upload one file to that record | Upload twice: fifty concurrent attempts have one winner |
 | A tool caller (often the model) | Tool arguments | Ask the server for a ticket, pass a file URI to a tool | Name a URL, host or path to stream into; use another owner's file when owners are set |
@@ -53,7 +57,8 @@ Every defence in that table has a scenario in `stress/run.py` that attacks it ov
 sockets: header bombs, slow clients, bursts past the concurrency cap, replayed and
 racing tickets, mismatched digests, other owners, a gateway killed mid-upload, malformed
 and randomized multipart framing, and failing clients and backends in one mixed run.
-The bearer modes have their own: missing, forged and other users' tokens, bearer-only
+The bearer modes have their own: missing, forged and other users' tokens, tokens
+issued for another resource against a real MCP server that refuses them, bearer-only
 replay races on the memory and SQLite stores and on Redis when one is reachable,
 headless flows against a real MCP server process, and destinations a client was not
 offered. A nightly CI job runs the ones that do not depend on timing and checks their
@@ -67,8 +72,10 @@ ceiling) run in the before-and-after comparisons for each release.
   travels in a header. Serve the endpoint over TLS only. Set `base_url` to an `https`
   origin.
 - **The token verifier.** In bearer modes the gateway trusts what `authenticate`
-  returns. Build it from the same verifier and required scopes that guard the MCP
-  route. A verifier that sets no subject makes every user of one OAuth client the same
+  returns. Build it from the same verifier, required scopes and token audience that
+  guard the MCP route: on the official SDK, `authenticator(verifier, auth=settings)`.
+  Without the settings, or with `validate_token_resource` unset or `False`, the
+  token's audience is checked only if your verifier checks it. A verifier that sets no subject makes every user of one OAuth client the same
   principal, unless you pass a `principal` function that tells them apart.
 - **Rate limiting.** The library caps concurrent uploads per process with
   `max_in_flight` (100 by default) and refuses beyond it with 503. Per-client rate

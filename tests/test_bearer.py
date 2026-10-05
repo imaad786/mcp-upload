@@ -9,6 +9,7 @@ the only credential, single use must still hold under concurrency in every store
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
 import time
@@ -26,12 +27,38 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 
 from mcp_upload import Destination, MemoryStore, Registry, SqliteStore, Store, UploadGateway
-from mcp_upload.auth import bearer_authenticator, bearer_token, token_principal
+from mcp_upload.auth import (
+    TokenRefused,
+    bearer_authenticator,
+    bearer_token,
+    canonical_resource,
+    issued_for,
+    token_principal,
+)
 from mcp_upload.tickets import utcnow
 from mcp_upload.types import EXTENSION_ID
 from tests.conftest import Upstream, multipart
 
 BASE = "http://gateway.test"
+HAS_OFFICIAL_SDK = importlib.util.find_spec("mcp.server.mcpserver") is not None
+HAS_FASTMCP = importlib.util.find_spec("fastmcp") is not None
+
+
+def _sdk_binds_resources() -> bool:
+    """Whether the installed SDK has ``validate_token_resource``, new in ``mcp`` 2.2."""
+    if not HAS_OFFICIAL_SDK:
+        return False
+    from mcp.server.auth.settings import AuthSettings
+
+    return "validate_token_resource" in AuthSettings.model_fields
+
+
+SDK_BINDS = _sdk_binds_resources()
+needs_sdk_binding = pytest.mark.skipif(not SDK_BINDS, reason="needs mcp 2.2 or later")
+
+# The resource this server's tokens are issued for, and another service's.
+OWN = "https://mcp.test/mcp"
+OTHER = "https://other.test/mcp"
 
 Authenticate = Callable[[Request], Awaitable["str | None"]]
 
@@ -46,11 +73,24 @@ class Token:
     scopes: list[str] = field(default_factory=lambda: ["files"])
     expires_at: int | None = None
     claims: dict[str, Any] | None = None
+    resource: str | None = OWN
+
+
+# ``<user>@<audience>-token`` is a token the verifier accepts for ``user`` but reports
+# as issued for that audience: a valid token minted for another service.
+AUDIENCES: dict[str, str | None] = {
+    "other": OTHER,
+    "none": None,
+    "child": f"{OWN}/child",
+    "respelled": "HTTPS://MCP.TEST:443/mcp/",
+    "garbage": "not a url",
+}
 
 
 class Verifier:
     """Accepts ``<user>-token`` and refuses anything else. ``expired-token`` verifies
-    but is past its expiry, and ``noscope-token`` carries no scopes."""
+    but is past its expiry, and ``noscope-token`` carries no scopes. Every token is
+    issued for ``OWN`` unless it names another audience after an ``@``."""
 
     def __init__(self) -> None:
         self.calls = 0
@@ -60,11 +100,30 @@ class Verifier:
         if not token.endswith("-token"):
             return None
         user = token.removesuffix("-token")
+        if "@" in user:
+            user, audience = user.split("@", 1)
+            return Token(token, subject=user, resource=AUDIENCES[audience])
         if user == "expired":
             return Token(token, subject=user, expires_at=int(time.time()) - 10)
         if user == "noscope":
             return Token(token, subject=user, scopes=[])
         return Token(token, subject=user)
+
+
+class CountingStore(MemoryStore):
+    """Counts record lookups, to show a refusal happened before any."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lookups = 0
+
+    async def get(self, record_id: str) -> Any:
+        self.lookups += 1
+        return await super().get(record_id)
+
+    async def get_by_hash(self, ticket_hash: str) -> Any:
+        self.lookups += 1
+        return await super().get_by_hash(ticket_hash)
 
 
 def by_subject(token: Any) -> str | None:
@@ -110,8 +169,8 @@ async def post(
     return await client.post(url, content=body, headers=headers)
 
 
-def subject_auth() -> Authenticate:
-    return bearer_authenticator(Verifier(), principal=by_subject)
+def subject_auth(resource: str | None = None) -> Authenticate:
+    return bearer_authenticator(Verifier(), principal=by_subject, resource=resource)
 
 
 # ----- the default mode is unchanged ---------------------------------------------------
@@ -350,6 +409,295 @@ async def test_ticket_and_bearer_race_has_one_winner(upstream: Upstream, store: 
         )
     assert sorted(r.status_code for r in replies).count(200) == 1
     assert len(upstream.bodies) == 1
+
+
+# ----- resource binding (RFC 8707) ------------------------------------------------------
+
+
+@pytest.mark.parametrize("ticket_in_url", [True, False])
+@pytest.mark.parametrize("audience", ["other", "none", "child", "garbage"])
+async def test_a_token_for_another_resource_spends_nothing(
+    upstream: Upstream, ticket_in_url: bool, audience: str
+) -> None:
+    store = CountingStore()
+    gateway = build(upstream, store, authenticate=subject_auth(OWN), ticket_in_url=ticket_in_url)
+    issued = await gateway.issue("files", owner="alice")
+    async with serve(gateway) as client:
+        refused = await post(client, issued.upload_url, token=f"alice@{audience}-token")
+        assert refused.status_code == 401, refused.text
+        assert refused.json() == {
+            "status": "failed",
+            "error": "invalid_token",
+            "details": {"reason": "wrongResource"},
+        }
+        assert refused.headers["www-authenticate"] == 'Bearer error="invalid_token"'
+        assert store.lookups == 0
+        assert (await gateway.status(issued.record.id))["status"] == "issued"
+        assert upstream.bodies == []
+        accepted = await post(client, issued.upload_url, token="alice-token")
+    assert accepted.status_code == 200, accepted.text
+    assert upstream.bodies == [b"hello"]
+
+
+async def test_the_resource_compares_as_a_url(upstream: Upstream) -> None:
+    # Case, a default port and a trailing slash do not make another resource.
+    gateway = build(upstream, authenticate=subject_auth("https://MCP.test:443/mcp/"))
+    issued = await gateway.issue("files", owner="alice")
+    async with serve(gateway) as client:
+        response = await post(client, issued.upload_url, token="alice@respelled-token")
+    assert response.status_code == 200, response.text
+
+
+async def test_without_a_resource_nothing_is_bound(upstream: Upstream) -> None:
+    gateway = build(upstream, authenticate=subject_auth())
+    issued = await gateway.issue("files", owner="alice")
+    async with serve(gateway) as client:
+        response = await post(client, issued.upload_url, token="alice@other-token")
+    assert response.status_code == 200, response.text
+
+
+async def test_custom_authenticators_can_refuse_with_a_reason(upstream: Upstream) -> None:
+    async def refuse(request: Request) -> str | None:
+        raise TokenRefused("tokenRevoked")
+
+    gateway = build(upstream, authenticate=refuse)
+    issued = await gateway.issue("files")
+    async with serve(gateway) as client:
+        response = await post(client, issued.upload_url, token="alice-token")
+    assert response.status_code == 401
+    assert response.json()["details"] == {"reason": "tokenRevoked"}
+    assert (await gateway.status(issued.record.id))["status"] == "issued"
+
+
+def test_a_resource_must_be_an_http_url() -> None:
+    for bad in ("", "not a url", "ftp://mcp.test/mcp"):
+        with pytest.raises(ValueError, match="HTTP"):
+            bearer_authenticator(Verifier(), resource=bad)
+
+
+@needs_sdk_binding
+@pytest.mark.parametrize("configured", ["https://mcp.test/mcp", "https://mcp.test"])
+async def test_resource_comparison_matches_the_sdk(configured: str) -> None:
+    # The upload route must accept exactly the tokens the MCP endpoint accepts.
+    from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend
+    from mcp.server.auth.settings import AuthSettings
+    from pydantic import AnyHttpUrl
+
+    settings = AuthSettings(
+        issuer_url=AnyHttpUrl("https://auth.test"),
+        resource_server_url=AnyHttpUrl(configured),
+        validate_token_resource=True,
+    )
+    unused: Any = Verifier()  # the backend's verifier plays no part in the comparison
+    sdk = BearerAuthBackend(unused, resource_server_url=settings.resource_server_url)
+    ours = canonical_resource(configured)
+    candidates: list[str | None] = [
+        None,
+        "",
+        "not a url",
+        configured,
+        configured + "/",
+        configured.upper(),
+        configured.replace("https://mcp.test", "https://mcp.test:443"),
+        configured.replace("https://mcp.test", "https://mcp.test:8443"),
+        configured.replace("https://", "http://"),
+        configured + "/child",
+        configured + "?x=1",
+        configured + "#frag",
+        "https://mcp.test/mcpx",
+        "https://other.test/mcp",
+        "https://mcp.test.evil/mcp",
+        " " + configured,
+    ]
+    for value in candidates:
+        token = Token("t", resource=value)
+        expected = sdk._issued_for_this_resource(value)
+        assert issued_for(token, ours) is expected, value
+
+
+async def outcome(authenticate: Authenticate, token: str) -> str:
+    """What an authenticator makes of ``token``: the principal, or why it refused."""
+    try:
+        principal = await authenticate(request_with({"Authorization": f"Bearer {token}"}))
+    except TokenRefused as exc:
+        return exc.reason
+    return principal or "refused"
+
+
+def sdk_settings(validate: bool | None, scopes: list[str] | None = None) -> Any:
+    from mcp.server.auth.settings import AuthSettings
+    from pydantic import AnyHttpUrl
+
+    return AuthSettings(
+        issuer_url=AnyHttpUrl("https://auth.test"),
+        resource_server_url=AnyHttpUrl(OWN),
+        validate_token_resource=validate,
+        required_scopes=scopes,
+    )
+
+
+@needs_sdk_binding
+@pytest.mark.parametrize(
+    ("validate", "resource", "own", "other", "unbound"),
+    [
+        # Follows the server's settings.
+        (True, None, "alice", "wrongResource", "wrongResource"),
+        (False, None, "alice", "alice", "alice"),
+        # An explicit argument wins either way.
+        (True, False, "alice", "alice", "alice"),
+        (False, OWN, "alice", "wrongResource", "wrongResource"),
+        (True, OTHER, "wrongResource", "alice", "wrongResource"),
+    ],
+)
+async def test_official_adapter_follows_the_server_settings(
+    validate: bool, resource: Any, own: str, other: str, unbound: str
+) -> None:
+    from mcp_upload.adapters import mcp as adapter
+
+    authenticate = adapter.authenticator(
+        Verifier(), principal=by_subject, auth=sdk_settings(validate), resource=resource
+    )
+    assert await outcome(authenticate, "alice-token") == own
+    assert await outcome(authenticate, "alice@other-token") == other
+    assert await outcome(authenticate, "alice@none-token") == unbound
+
+
+async def test_settings_and_tokens_from_before_mcp_2_2() -> None:
+    # On mcp 2.1 the settings have no validate_token_resource and the tokens no
+    # resource. Nothing is bound by default, and an explicit binding refuses them all.
+    from types import SimpleNamespace
+
+    from mcp_upload.adapters import mcp as adapter
+
+    @dataclass
+    class OldToken:
+        token: str
+        client_id: str
+        subject: str
+        scopes: list[str] = field(default_factory=list)
+
+    class OldVerifier:
+        async def verify_token(self, token: str) -> OldToken | None:
+            return OldToken(token, "app", "alice") if token == "alice-token" else None
+
+    settings = SimpleNamespace(resource_server_url=OWN, required_scopes=None)
+    follows = adapter.authenticator(OldVerifier(), principal=by_subject, auth=settings)
+    explicit = adapter.authenticator(OldVerifier(), principal=by_subject, resource=OWN)
+    assert await outcome(follows, "alice-token") == "alice"
+    assert await outcome(explicit, "alice-token") == "wrongResource"
+
+
+@pytest.mark.skipif(not HAS_OFFICIAL_SDK, reason="official SDK 2.x not installed")
+async def test_official_adapter_without_settings_binds_nothing() -> None:
+    from mcp_upload.adapters import mcp as adapter
+
+    plain = adapter.authenticator(Verifier(), principal=by_subject)
+    assert await outcome(plain, "alice@other-token") == "alice"
+    assert await outcome(plain, "noscope-token") == "noscope"
+    bound = adapter.authenticator(Verifier(), principal=by_subject, resource=OWN)
+    assert await outcome(bound, "alice@other-token") == "wrongResource"
+
+
+@pytest.mark.skipif(not HAS_OFFICIAL_SDK, reason="official SDK 2.x not installed")
+async def test_official_adapter_takes_the_server_scopes() -> None:
+    from mcp_upload.adapters import mcp as adapter
+
+    settings = sdk_settings(False, scopes=["files"])
+    inherited = adapter.authenticator(Verifier(), principal=by_subject, auth=settings)
+    assert await outcome(inherited, "noscope-token") == "refused"
+    assert await outcome(inherited, "alice-token") == "alice"
+    overridden = adapter.authenticator(
+        Verifier(), principal=by_subject, auth=settings, required_scopes=()
+    )
+    assert await outcome(overridden, "noscope-token") == "noscope"
+
+
+@needs_sdk_binding
+@pytest.mark.parametrize("validate", [True, False])
+async def test_the_upload_route_takes_the_tokens_the_mcp_endpoint_takes(
+    upstream: Upstream, validate: bool
+) -> None:
+    # One MCPServer, one verifier, one AuthSettings. Whatever the MCP endpoint does with
+    # a token issued for another resource, the upload route does the same, before the
+    # ticket is spent.
+    from mcp.server.auth.provider import AccessToken
+    from mcp.server.mcpserver import MCPServer
+
+    from mcp_upload.adapters import mcp as adapter
+
+    class SdkTokens:
+        async def verify_token(self, token: str) -> AccessToken | None:
+            found = await Verifier().verify_token(token)
+            if found is None:
+                return None
+            return AccessToken(
+                token=token,
+                client_id="app",
+                subject=found.subject,
+                scopes=found.scopes,
+                resource=found.resource,
+            )
+
+    settings = sdk_settings(validate)
+    verifier = SdkTokens()
+    gateway = build(
+        upstream, authenticate=adapter.authenticator(verifier, auth=settings), ticket_in_url=False
+    )
+    server = MCPServer("resource-bound", auth=settings, token_verifier=verifier)
+    adapter.attach(server, gateway)
+    app = server.streamable_http_app(stateless_http=True, json_response=True)
+    owner = token_principal(await verifier.verify_token("alice-token"))
+    async with (
+        server.session_manager.run(),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=BASE) as client,
+    ):
+        ping = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        mcp_codes = {}
+        upload_codes = {}
+        for token in ("alice@other-token", "alice@none-token", "alice-token"):
+            response = await client.post(
+                "http://127.0.0.1:8000/mcp",
+                json=ping,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json, text/event-stream",
+                },
+            )
+            assert response.status_code in (200, 401), response.text
+            mcp_codes[token] = response.status_code == 401
+            issued = await gateway.issue("files", owner=owner)
+            upload = await post(client, issued.upload_url, token=token)
+            upload_codes[token] = upload.status_code == 401
+            if upload.status_code == 401:
+                assert upload.json()["details"] == {"reason": "wrongResource"}
+                assert (await gateway.status(issued.record.id))["status"] == "issued"
+    assert upload_codes == mcp_codes
+    assert mcp_codes == {
+        "alice@other-token": validate,
+        "alice@none-token": validate,
+        "alice-token": False,
+    }
+    assert len(upstream.bodies) == (1 if validate else 3)
+
+
+@pytest.mark.skipif(not HAS_FASTMCP, reason="fastmcp not installed")
+async def test_fastmcp_adapter_binds_only_when_asked() -> None:
+    from fastmcp import FastMCP
+    from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+
+    from mcp_upload.adapters import fastmcp as fast_adapter
+
+    provider = StaticTokenVerifier(
+        tokens={"alice-token": {"client_id": "app", "sub": "alice", "scopes": []}}
+    )
+    fast = FastMCP("resource", auth=provider)
+    plain = fast_adapter.authenticator(fast, principal=by_subject)
+    bound = fast_adapter.authenticator(fast, principal=by_subject, resource=OWN)
+    # FastMCP checks a token's audience in the provider, which both call. Its tokens
+    # carry no resource, so an explicit binding refuses them.
+    assert await outcome(plain, "alice-token") == "alice"
+    assert await outcome(bound, "alice-token") == "wrongResource"
+    assert await outcome(bound, "bob-token") == "refused"
 
 
 # ----- resume --------------------------------------------------------------------------

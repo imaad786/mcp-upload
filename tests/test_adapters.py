@@ -91,6 +91,7 @@ async def test_official_sdk_auth_does_not_guard_the_upload_route(
         auth=AuthSettings(
             issuer_url=AnyHttpUrl("http://auth.test"),
             resource_server_url=AnyHttpUrl("http://server.test/mcp"),
+            validate_token_resource=False,
         ),
         token_verifier=DenyAll(),
     )

@@ -42,6 +42,8 @@ if HAS_FASTMCP:
     from fastmcp import Context as FastContext
 
 BASE = "http://server.test"
+# What the tokens are issued for: the MCP endpoint of the loopback server below.
+RESOURCE = "http://127.0.0.1:8000/mcp"
 DATA = b"quarterly numbers\n" * 100
 
 
@@ -65,7 +67,9 @@ class Tokens:
 
         if not token.endswith("-token"):
             return None
-        return AccessToken(token=token, client_id="app", subject=token[:-6], scopes=[])
+        return AccessToken(
+            token=token, client_id="app", subject=token[:-6], scopes=[], resource=RESOURCE
+        )
 
 
 def subject(token: Any) -> str | None:
@@ -452,17 +456,18 @@ async def test_the_same_token_authorizes_the_call_and_the_upload(
         from mcp_upload.adapters import mcp as adapter
 
         verifier = Tokens()
+        settings = AuthSettings(
+            issuer_url=AnyHttpUrl("http://auth.test"),
+            resource_server_url=AnyHttpUrl(f"{loopback}/mcp"),
+            validate_token_resource=True,
+        )
         gateway = make_gateway(
-            upstream, store, authenticate=adapter.authenticator(verifier), ticket_in_url=False
+            upstream,
+            store,
+            authenticate=adapter.authenticator(verifier, auth=settings),
+            ticket_in_url=False,
         )
-        server = MCPServer(
-            "same-token",
-            auth=AuthSettings(
-                issuer_url=AnyHttpUrl("http://auth.test"),
-                resource_server_url=AnyHttpUrl(f"{loopback}/mcp"),
-            ),
-            token_verifier=verifier,
-        )
+        server = MCPServer("same-token", auth=settings, token_verifier=verifier)
 
         async def fetch_report(ctx: Context[Any, Any]) -> UploadStatus | InputRequiredResult:
             return await adapter.ask_for_upload(

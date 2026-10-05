@@ -21,7 +21,14 @@ of the tool call) and when the upload arrives (from the token on the upload requ
 or no upload would ever match its owner. ``token_principal`` is that one computation.
 The adapters' ``current_principal()`` applies it to the tool call's token.
 
-Nothing here imports an MCP framework. Tokens are read by duck typing.
+A token can also be bound to the server it was issued for (RFC 8707). With
+``resource`` set, ``bearer_authenticator`` refuses a token whose ``resource`` is not
+that URL, compared as the official SDK compares it for
+``AuthSettings.validate_token_resource``, so a token minted for another service cannot
+upload here even though the shared verifier accepts it.
+
+Nothing here imports an MCP framework. Tokens are read by duck typing. Resource binding
+parses URLs with pydantic, which both supported frameworks depend on.
 """
 
 from __future__ import annotations
@@ -39,6 +46,17 @@ Authenticator = Callable[[Request], Awaitable["str | None"]]
 
 #: Maps a verified access token to a principal string.
 Principal = Callable[[Any], "str | None"]
+
+
+class TokenRefused(Exception):
+    """Raised by an authenticator for a token it verified but will not accept. The
+    gateway answers 401 ``invalid_token`` with ``details: {"reason": reason}``, before
+    the ticket is looked up or spent. Returning ``None`` gives the same status with the
+    reason ``invalidToken``."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 class TokenVerifier(Protocol):
@@ -81,11 +99,36 @@ def token_principal(token: Any) -> str | None:
     return json.dumps(parts, separators=(",", ":"))
 
 
+def canonical_resource(url: Any) -> str:
+    """``url`` as the official SDK compares resources: parsed as an HTTP(S) URL, so the
+    case of the scheme and host and a default port do not matter, without a trailing
+    slash. Raises ``ValueError`` for anything that is not an HTTP(S) URL."""
+    from pydantic import AnyHttpUrl, ValidationError
+
+    try:
+        return str(AnyHttpUrl(str(url))).removesuffix("/")
+    except ValidationError as exc:
+        raise ValueError(f"not an HTTP(S) URL: {url!r}") from exc
+
+
+def issued_for(token: Any, resource: str) -> bool:
+    """Whether ``token.resource`` names ``resource`` (a ``canonical_resource``). A token
+    without a ``resource`` was not issued for this server, as in the SDK."""
+    value = getattr(token, "resource", None)
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        return canonical_resource(value) == resource
+    except ValueError:
+        return False
+
+
 def bearer_authenticator(
     verifier: TokenVerifier,
     *,
     principal: Principal = token_principal,
     required_scopes: Iterable[str] = (),
+    resource: str | None = None,
 ) -> Authenticator:
     """An authenticator that reads ``Authorization: Bearer <token>``, checks the token
     with ``verifier``, and returns ``principal(token)``.
@@ -93,8 +136,17 @@ def bearer_authenticator(
     A token the verifier refuses, one past its ``expires_at``, and one without every
     scope in ``required_scopes`` all authenticate nobody. Pass the scopes your MCP
     endpoint requires, so a token that could not call a tool cannot upload either.
+
+    ``resource`` is the server's canonical URL, its ``resource_server_url``. With it,
+    a token whose ``resource`` (the RFC 8707 resource indicator the verifier reports)
+    is another URL, or is missing, raises ``TokenRefused("wrongResource")``. This is the
+    check the SDK's ``AuthSettings.validate_token_resource`` makes on the MCP endpoint;
+    the official SDK's adapter turns it on when the server's settings do. Tokens from
+    ``mcp`` 2.1 carry no ``resource``, so with binding requested every one of them is
+    refused.
     """
     scopes = frozenset(required_scopes)
+    bound = None if resource is None else canonical_resource(resource)
 
     async def authenticate(request: Request) -> str | None:
         token = bearer_token(request)
@@ -106,6 +158,8 @@ def bearer_authenticator(
         expires_at = getattr(verified, "expires_at", None)
         if isinstance(expires_at, int | float) and expires_at < time.time():
             return None
+        if bound is not None and not issued_for(verified, bound):
+            raise TokenRefused("wrongResource")
         if scopes and not scopes <= set(getattr(verified, "scopes", None) or ()):
             return None
         return principal(verified)
@@ -116,8 +170,11 @@ def bearer_authenticator(
 __all__ = [
     "Authenticator",
     "Principal",
+    "TokenRefused",
     "TokenVerifier",
     "bearer_authenticator",
     "bearer_token",
+    "canonical_resource",
+    "issued_for",
     "token_principal",
 ]

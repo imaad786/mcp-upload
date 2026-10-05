@@ -37,9 +37,19 @@ A gateway built with `authenticate` checks a bearer token on every upload, and w
 [Requiring a bearer token](https://github.com/imaad786/mcp-upload/blob/main/guide/usage.md#requiring-a-bearer-token)
 for the modes. What changes for a deployment:
 
-- **Use the server's own verifier.** Build the authenticator from the same token
-  verifier or auth provider that guards the MCP route, with the same required scopes,
-  so a token that cannot call a tool cannot upload either.
+- **Use the server's own verifier and settings.** Build the authenticator from the
+  same token verifier or auth provider that guards the MCP route, with the same
+  required scopes, so a token that cannot call a tool cannot upload either. On the
+  official SDK, pass the server's `AuthSettings` as `authenticator(verifier, auth=...)`.
+- **The same token audience as the MCP endpoint.** With
+  `validate_token_resource=True` in those settings, the MCP endpoint refuses a token
+  issued for another resource (RFC 8707), and since 1.1.1 the upload route refuses it
+  too, with 401 `invalid_token` and `{"reason": "wrongResource"}`, before the ticket is
+  spent. On 1.1.0 the upload route accepted such a token. Set the flag explicitly:
+  `mcp` 2.2 warns when it is unset, and says 3.0 will default it to `True`. If your
+  verifier checks the audience itself, as FastMCP's JWT verifier does with
+  `audience=`, set it to `False` and the upload route gets the same check through the
+  verifier.
 - **Forward the Authorization header.** A proxy or gateway in front of the upload path
   must pass `Authorization` through, as it does for the MCP route.
 - **Owners are mandatory in bearer-only mode.** Issue every ticket with

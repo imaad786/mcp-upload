@@ -270,6 +270,42 @@ def bearer_auth(r: dict[str, Any], out: Problems) -> None:
         )
 
 
+def bearer_resource(r: dict[str, Any], out: Problems) -> None:
+    for part in ("ticket_bearer", "bearer"):
+        p = r.get(part)
+        name = f"bearer_resource.{part}"
+        if unsupported(p):
+            continue
+        if not isinstance(p, dict):
+            out.append(f"{name} missing")
+            continue
+        n = p.get("flows_each")
+        expected = {
+            "honest_outcomes": {"completed": n},
+            "wrong_resource_upload_outcome": {"wrongResource": n},
+            "ticket_after_wrong_resource": {"issued": n},
+            "owner_after_wrong_resource": {"completed": n},
+            "mcp_endpoint_with_wrong_resource": {"401": n},
+            "flow_errors": [],
+        }
+        for key, want in expected.items():
+            if p.get(key) != want:
+                out.append(f"{name}.{key} = {p.get(key)!r}")
+        if set(p.get("wrong_resource_upload_http") or {"none": 1}) - {"401"}:
+            out.append(
+                f"{name}.wrong_resource_upload_http = {p.get('wrong_resource_upload_http')!r}"
+            )
+        if p.get("backend_commits") != 2 * n or p.get("expected_commits") != 2 * n:
+            out.append(
+                f"{name}: {p.get('backend_commits')!r} backend commits, "
+                f"{p.get('expected_commits')!r} expected, {2 * n} flows"
+            )
+        if p.get("commits_matching_sent_sha256") != p.get("expected_commits"):
+            out.append(
+                f"{name}.commits_matching_sent_sha256 = {p.get('commits_matching_sent_sha256')!r}"
+            )
+
+
 def all_flows_passed(
     name: str, kinds: tuple[str, ...]
 ) -> Callable[[dict[str, Any], Problems], None]:
@@ -311,6 +347,7 @@ SPECIFIC: dict[str, Callable[[dict[str, Any], Problems], None]] = {
     "sink_mixed_failures": sink_mixed_failures,
     "raw_uploads": raw_uploads,
     "bearer_auth": bearer_auth,
+    "bearer_resource": bearer_resource,
     "headless_flow": all_flows_passed(
         "headless_flow", ("good", "early_retry", "proof_mismatch", "wrong_token")
     ),

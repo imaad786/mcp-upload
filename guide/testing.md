@@ -30,12 +30,14 @@ and it writes JSON so two versions can be compared:
 .venv/bin/python stress/run.py --src src --out after.json
 ```
 
-The two processes are `stress/gateway.py` and `stress/backend.py`. `headless_flow` and
-`destination_choice` start `stress/mcp_server.py` in place of the gateway: an official
-SDK `MCPServer` with the gateway attached, its MCP route guarded by a bearer token
-verifier, a tool that asks for a file with `ask_for_upload`, and the extension
-offering one destination besides the default. The harness drives it with the official
-SDK client, as a headless harness would. The backend commits
+The two processes are `stress/gateway.py` and `stress/backend.py`. `headless_flow`,
+`bearer_resource` and `destination_choice` start `stress/mcp_server.py` in place of the
+gateway: an official SDK `MCPServer` with the gateway attached, its MCP route guarded
+by a bearer token verifier, a tool that asks for a file with `ask_for_upload`, and the
+extension offering one destination besides the default. The harness drives it with the
+official SDK client, as a headless harness would. `bearer_resource` runs it with
+`validate_token_resource=True` and also sends valid tokens issued for another
+resource, which the MCP route refuses, to check that uploads refuse them too. The backend commits
 an upload only when the request body ended cleanly, and records the size and SHA-256
 of every commit, so the harness can check that what the gateway reported is what
 actually arrived. The gateway is killed if its memory passes 6,000 MB, to protect the

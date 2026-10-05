@@ -300,18 +300,24 @@ that claims an upload the record does not show is simply asked again.
 By default the ticket in the URL is the only credential, which is what lets a person
 upload from a browser. Some deployments cannot accept a credential in a URL at all, and
 want every request, uploads included, to carry the same bearer token as their MCP
-requests. Give the gateway an authenticator built from the verifier the server already
-uses:
+requests. Give the gateway an authenticator built from the verifier and the auth
+settings the server already uses:
 
 ```python
 from mcp_upload.adapters.mcp import ask_for_upload, authenticator, current_principal
 
 verifier = MyTokenVerifier()  # the SDK's TokenVerifier, also passed to MCPServer
+settings = AuthSettings(
+    issuer_url=...,
+    resource_server_url="https://files.example.com/mcp",
+    validate_token_resource=True,
+)
 gateway = UploadGateway(
     ...,
-    authenticate=authenticator(verifier),
+    authenticate=authenticator(verifier, auth=settings),
     ticket_in_url=False,  # the token is the only credential
 )
+mcp = MCPServer("files", auth=settings, token_verifier=verifier)
 
 
 @mcp.tool()
@@ -334,8 +340,18 @@ There are three modes:
   `principal=` to both with a function that picks a user id claim.
 - **Refusals** happen before the ticket is spent and before the record is looked up.
   No token is 401 with `WWW-Authenticate: Bearer` and `{"reason": "authRequired"}`. A
-  token the verifier refuses, or one past its expiry, is 401 `invalid_token`. Another
-  user's valid token is 403 `forbidden` with `{"reason": "ownerMismatch"}`.
+  token the verifier refuses, or one past its expiry, is 401 `invalid_token`. A token
+  issued for another resource is 401 `invalid_token` with
+  `{"reason": "wrongResource"}`. Another user's valid token is 403 `forbidden` with
+  `{"reason": "ownerMismatch"}`.
+- **The same audience as the MCP endpoint.** With `auth=settings`, the upload route
+  checks a token as the MCP endpoint does: the settings' `required_scopes`, and with
+  `validate_token_resource=True` only tokens whose `resource` is `resource_server_url`,
+  compared as the SDK compares it. A token with no `resource` is refused there too.
+  `resource="https://..."` binds to another URL, and `resource=False` turns the check
+  off. Without `auth`, neither is checked, as in 1.1.0. On `mcp` 2.1 the settings have
+  no `validate_token_resource` and tokens no `resource`, so nothing is bound unless you
+  pass `resource`, and then only tokens whose verifier reports one get through.
 - **Single use still holds** with no secret in the URL. The URL is public and the
   owner's token is reusable, so the gateway redeems through the hash the record
   stores, in the same atomic step as a ticket. The test suite sends fifty concurrent
@@ -354,7 +370,11 @@ There are three modes:
   `{"reason": "ownerRequired"}`.
 
 On FastMCP 4, `authenticator(mcp)` uses the server's own auth provider and its
-required scopes, and `current_principal()` reads FastMCP's access token:
+required scopes, and `current_principal()` reads FastMCP's access token. FastMCP leaves
+the token's audience to the provider (`JWTVerifier(audience=...)`), whose
+`verify_token` the upload route calls too. `resource=` adds the SDK's resource check on
+top, for a provider that sets `AccessToken.resource`; the providers in FastMCP 4.0.10
+do not.
 
 ```python
 from mcp_upload.adapters.fastmcp import authenticator, current_principal
@@ -366,7 +386,9 @@ gateway = UploadGateway(..., authenticate=authenticator(mcp), ticket_in_url=Fals
 Any other scheme fits too. `authenticate` is any coroutine function that takes the
 Starlette request and returns a principal or `None`, and
 `mcp_upload.auth.bearer_authenticator` builds one from any object with
-`async verify_token(token)`.
+`async verify_token(token)`, and takes `resource=` for the same binding. An
+authenticator can raise `mcp_upload.auth.TokenRefused(reason)` to answer 401
+`invalid_token` with that reason.
 
 ### After an upload
 

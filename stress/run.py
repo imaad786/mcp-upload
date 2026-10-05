@@ -1982,7 +1982,7 @@ async def bearer_auth(src: str) -> dict[str, Any]:
     return result
 
 
-def start_mcp(src: str, auth: str) -> Stack:
+def start_mcp(src: str, auth: str, *extra: str) -> Stack:
     """The stress backend and an MCP server process (``mcp_server.py``) in front of it."""
     env = {**os.environ, "PYTHONPATH": src}
     bport = free_port()
@@ -1999,6 +1999,7 @@ def start_mcp(src: str, auth: str) -> Stack:
             f"http://127.0.0.1:{bport}",
             "--auth",
             auth,
+            *extra,
         ],
         env=env,
     )
@@ -2249,6 +2250,150 @@ async def headless_flow(src: str) -> dict[str, Any]:
             "backend_commits": len(commits),
             "expected_commits": len(sent),
             "commits_matching_sent_sha256": matching,
+        },
+    )
+
+
+@scenario
+async def bearer_resource(src: str) -> dict[str, Any]:
+    """Tokens issued for another service (RFC 8707 audience binding). A real MCP server
+    process with the SDK's ``validate_token_resource=True``, in ticket-and-bearer and in
+    bearer-only mode. Per mode, 50 honest flows (tool call, upload with the caller's
+    token) and 50 flows where the caller's ticket is first tried with a token that the
+    shared verifier accepts for the same user but reports as issued for another
+    resource. Those tickets declare no size or digest, so the token is all that guards
+    them. The MCP endpoint refuses that token; the upload route must refuse it too, with
+    401 before the ticket is spent, commit none of its bytes, and leave the ticket to
+    its owner's own token. Raw counts are reported, so a version that accepts the token
+    shows how many it let through."""
+    result: dict[str, Any] = {}
+    for mode in ("ticket_bearer", "bearer"):
+        part = await resource_mode(src, mode)
+        if part.get("supported") is False:
+            return part
+        result[mode] = part
+    return {"supported": True, **result}
+
+
+async def resource_mode(src: str, mode: str, n: int = 50) -> dict[str, Any]:
+    stack = start_mcp(src, mode, "--validate-resource")
+    caps = await get_json(stack.gateway_port, "/_caps")
+    if missing := lacking(caps, "ask_target", "authenticate"):
+        return unsupported(stack, missing)
+
+    import httpx
+    from mcp_types import InputRequiredResult
+
+    port = stack.gateway_port
+    rng = random.Random(37 if mode == "bearer" else 41)
+    sent: dict[str, str] = {}  # record id -> sha256 hex of the bytes that must commit
+    foreign_bytes: set[str] = set()  # sha256 hex of every body sent with a foreign token
+    honest: Counter[str] = Counter()
+    foreign_http: Counter[str] = Counter()
+    foreign_reason: Counter[str] = Counter()
+    after_refusal: Counter[str] = Counter()
+    owner_after: Counter[str] = Counter()
+    mcp_foreign: Counter[str] = Counter()
+    errors: list[str] = []
+
+    async def ask(session: Any, data: bytes | None, state: str | None = None) -> Any:
+        declared = {} if data is None else {"size": len(data), "digest": b64_sha256(data)}
+        return await session.call_tool(
+            "fetch_report", declared, request_state=state, allow_input_required=True
+        )
+
+    def label(code: int, body: dict[str, Any]) -> str:
+        return str(body.get("status") or body.get("error") or code)
+
+    async def honest_flow(i: int, uploads: Any) -> None:
+        user = f"honest{i}"
+        data = rng.randbytes(rng.randint(1024, 64 * 1024))
+        async with mcp_session(port, user) as session:
+            first = await ask(session, data)
+        target = target_in(first)
+        code, body = await put_bytes(uploads, target, data, token_for(user))
+        honest[label(code, body)] += 1
+        if code == 200:
+            sent[body["file"]["uri"].rsplit("/", 1)[1]] = hashlib.sha256(data).hexdigest()
+
+    async def foreign_flow(i: int, uploads: Any) -> None:
+        user = f"victim{i}"
+        data = rng.randbytes(4096)
+        stolen = rng.randbytes(4096)
+        foreign_bytes.add(hashlib.sha256(stolen).hexdigest())
+        async with mcp_session(port, user) as session:
+            # No declared size or digest, so the token is all that guards the ticket.
+            first = await ask(session, None)
+            target = target_in(first)
+            try:
+                code, body = await put_bytes(uploads, target, stolen, token_for(f"{user}@other"))
+            except httpx.TransportError:
+                code, body = 0, {}
+            foreign_http[str(code)] += 1
+            foreign_reason[(body.get("details") or {}).get("reason") or label(code, body)] += 1
+            # An early retry is answered with the same request while the ticket is
+            # unspent, and with something else once it has been used.
+            still = await ask(session, None, first.request_state)
+            after_refusal["issued" if isinstance(still, InputRequiredResult) else "spent"] += 1
+            code, body = await put_bytes(uploads, target, data, token_for(user))
+            owner_after[label(code, body)] += 1
+            if code == 200:
+                sent[body["file"]["uri"].rsplit("/", 1)[1]] = hashlib.sha256(data).hexdigest()
+        # The same token on the MCP endpoint, for comparison. The SDK client hides the
+        # HTTP status of a refusal, so this is a plain JSON-RPC POST.
+        response = await uploads.post(
+            f"http://127.0.0.1:{port}/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            headers={
+                "Authorization": f"Bearer {token_for(f'{user}@other')}",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+        mcp_foreign[str(response.status_code)] += 1
+
+    async def guarded(flow: Awaitable[None]) -> None:
+        try:
+            await flow
+        except Exception as exc:
+            if len(errors) < 5:
+                errors.append(f"{type(exc).__name__}: {exc}"[:300])
+
+    gate = asyncio.Semaphore(50)
+    async with httpx.AsyncClient(limits=httpx.Limits(max_connections=100), timeout=60.0) as uploads:
+
+        async def one(flow: Callable[[int, Any], Awaitable[None]], i: int) -> None:
+            async with gate:
+                await guarded(flow(i, uploads))
+
+        jobs = [one(honest_flow, i) for i in range(n)] + [one(foreign_flow, i) for i in range(n)]
+        random.Random(7).shuffle(jobs)
+        t0 = time.perf_counter()
+        await asyncio.gather(*jobs)
+        wall = time.perf_counter() - t0
+
+    await asyncio.sleep(0.5)
+    commits: dict[str, Any] = (await backend(stack))["commits"]
+    shas = [c.get("sha256") for c in commits.values()]
+    return finish(
+        stack,
+        {
+            "supported": True,
+            "upload_route_takes_server_settings": caps.get("upload_route_takes_server_settings"),
+            "flows_each": n,
+            "wall_s": round(wall, 2),
+            "honest_outcomes": dict(honest),
+            "wrong_resource_upload_http": dict(foreign_http),
+            "wrong_resource_upload_outcome": dict(foreign_reason),
+            "ticket_after_wrong_resource": dict(after_refusal),
+            "owner_after_wrong_resource": dict(owner_after),
+            "mcp_endpoint_with_wrong_resource": dict(mcp_foreign),
+            "refused_but_committed": sum(sha in foreign_bytes for sha in shas),
+            "backend_commits": len(commits),
+            "expected_commits": len(sent),
+            "commits_matching_sent_sha256": sum(
+                commits.get(rid, {}).get("sha256") == sha for rid, sha in sent.items()
+            ),
+            "flow_errors": errors,
         },
     )
 
